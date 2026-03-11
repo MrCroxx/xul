@@ -9,7 +9,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import re
+import socket
 import sys
 import time
 import urllib.error
@@ -52,12 +54,14 @@ class GitHubClient:
         timeout: int = 30,
         max_retries: int = 5,
         backoff_seconds: float = 1.5,
+        max_backoff_seconds: float = 30.0,
         verbose: bool = False,
     ) -> None:
         self.token = token
         self.timeout = timeout
         self.max_retries = max_retries
         self.backoff_seconds = backoff_seconds
+        self.max_backoff_seconds = max_backoff_seconds
         self.verbose = verbose
 
     def _build_headers(self) -> Dict[str, str]:
@@ -90,7 +94,7 @@ class GitHubClient:
                     time.sleep(wait_seconds)
                     continue
                 if err.code in RETRYABLE_STATUS_CODES and attempt < self.max_retries:
-                    wait_seconds = self.backoff_seconds * (2**attempt)
+                    wait_seconds = self._retry_delay_seconds(attempt, err.headers)
                     self._log(
                         f"retryable status={err.code}, retry in {wait_seconds:.1f}s: {url}"
                     )
@@ -101,9 +105,14 @@ class GitHubClient:
                 raise RuntimeError(
                     f"GitHub API error status={err.code} url={url} body={body}"
                 ) from err
-            except urllib.error.URLError as err:
+            except (
+                urllib.error.URLError,
+                TimeoutError,
+                ConnectionResetError,
+                socket.timeout,
+            ) as err:
                 if attempt < self.max_retries:
-                    wait_seconds = self.backoff_seconds * (2**attempt)
+                    wait_seconds = self._retry_delay_seconds(attempt)
                     self._log(
                         f"network error ({err}), retry in {wait_seconds:.1f}s: {url}"
                     )
@@ -129,6 +138,22 @@ class GitHubClient:
             return 60.0
         # Add a small safety margin to avoid immediate next 403.
         return max(1.0, reset_ts - time.time() + 1.0)
+
+    def _retry_delay_seconds(
+        self, attempt: int, headers: Optional[Dict[str, str]] = None
+    ) -> float:
+        if headers is not None:
+            retry_after = headers.get("Retry-After")
+            if retry_after:
+                try:
+                    return max(0.1, min(float(retry_after), self.max_backoff_seconds))
+                except ValueError:
+                    pass
+
+        base = self.backoff_seconds * (2**attempt)
+        capped = min(base, self.max_backoff_seconds)
+        jitter = random.uniform(0.8, 1.2)
+        return max(0.1, capped * jitter)
 
     def _log(self, message: str) -> None:
         if self.verbose:
@@ -228,13 +253,22 @@ def export_repo(
     state: str,
     verbose: bool,
     resume: bool,
+    max_retries: int,
+    backoff_seconds: float,
+    max_backoff_seconds: float,
 ) -> None:
     started_at = time.time()
     owner, name = parse_repo(repo)
     output_dir.mkdir(parents=True, exist_ok=True)
     output_dir = output_dir.resolve()
 
-    client = GitHubClient(token=token, verbose=verbose)
+    client = GitHubClient(
+        token=token,
+        verbose=verbose,
+        max_retries=max_retries,
+        backoff_seconds=backoff_seconds,
+        max_backoff_seconds=max_backoff_seconds,
+    )
     issues_url = f"{API_ROOT}/repos/{owner}/{name}/issues"
     log(
         f"[START] repo={owner}/{name} state={state} output_dir={output_dir} "
@@ -414,6 +448,24 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Do not reuse existing per-item JSON files; always refetch",
     )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=5,
+        help="Max retry attempts for transient network/API errors (default: 5)",
+    )
+    parser.add_argument(
+        "--backoff-seconds",
+        type=float,
+        default=1.5,
+        help="Initial exponential backoff delay in seconds (default: 1.5)",
+    )
+    parser.add_argument(
+        "--max-backoff-seconds",
+        type=float,
+        default=30.0,
+        help="Maximum retry delay in seconds (default: 30.0)",
+    )
     return parser.parse_args(argv)
 
 
@@ -434,6 +486,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             state=args.state,
             verbose=args.verbose,
             resume=not args.no_resume,
+            max_retries=max(0, args.max_retries),
+            backoff_seconds=max(0.1, args.backoff_seconds),
+            max_backoff_seconds=max(0.1, args.max_backoff_seconds),
         )
     except Exception as err:  # noqa: BLE001
         print(f"error: {err}", file=sys.stderr)
