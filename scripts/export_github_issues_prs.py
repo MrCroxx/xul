@@ -189,6 +189,25 @@ def safe_write_json(path: Path, obj: object) -> None:
     temp_path.replace(path)
 
 
+def load_record_stats(path: Path) -> Optional[Tuple[int, int, int]]:
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    if not isinstance(data, dict):
+        return None
+    issue_comments = data.get("issue_comments")
+    review_comments = data.get("pull_request_review_comments")
+    reviews = data.get("pull_request_reviews")
+
+    issue_comment_count = len(issue_comments) if isinstance(issue_comments, list) else 0
+    review_comment_count = len(review_comments) if isinstance(review_comments, list) else 0
+    review_count = len(reviews) if isinstance(reviews, list) else 0
+    return issue_comment_count, review_comment_count, review_count
+
+
 def log(message: str) -> None:
     print(message, flush=True)
 
@@ -202,7 +221,14 @@ def format_duration(seconds: float) -> str:
     return f"{m:02d}:{s:02d}"
 
 
-def export_repo(repo: str, output_dir: Path, token: str, state: str, verbose: bool) -> None:
+def export_repo(
+    repo: str,
+    output_dir: Path,
+    token: str,
+    state: str,
+    verbose: bool,
+    resume: bool,
+) -> None:
     started_at = time.time()
     owner, name = parse_repo(repo)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -246,11 +272,16 @@ def export_repo(repo: str, output_dir: Path, token: str, state: str, verbose: bo
         f"[STEP 2/2] fetched {total_items} items "
         f"(issues={total_issues}, prs={total_prs})"
     )
+    log(
+        f"[STEP 2/2] dump mode={'resume' if resume else 'overwrite'} "
+        f"output_dir={output_dir}"
+    )
     log("[PROGRESS] start dumping per-item JSON ...")
 
     total_issue_comments = 0
     total_review_comments = 0
     total_reviews = 0
+    resumed_items = 0
 
     for index, issue in enumerate(issues, start=1):
         item_started_at = time.time()
@@ -259,6 +290,36 @@ def export_repo(repo: str, output_dir: Path, token: str, state: str, verbose: bo
         number = issue["number"]
         is_pr = "pull_request" in issue
         kind = "pr" if is_pr else "issue"
+        out_path = output_dir / f"{kind}_{number:06d}.json"
+
+        if resume and out_path.exists():
+            cached_stats = load_record_stats(out_path)
+            if cached_stats is not None:
+                issue_comment_count, review_comment_count, review_count = cached_stats
+                total_issue_comments += issue_comment_count
+                total_review_comments += review_comment_count
+                total_reviews += review_count
+                resumed_items += 1
+
+                elapsed = time.time() - started_at
+                speed = index / elapsed if elapsed > 0 else 0.0
+                remain = total_items - index
+                eta_seconds = (remain / speed) if speed > 0 else 0.0
+                item_elapsed = time.time() - item_started_at
+                percent = (index / total_items * 100.0) if total_items > 0 else 100.0
+                log(
+                    f"[{index}/{total_items} {percent:6.2f}%] "
+                    f"{kind}#{number} reused={out_path.name} "
+                    f"issue_comments={issue_comment_count} "
+                    f"pr_review_comments={review_comment_count} "
+                    f"pr_reviews={review_count} "
+                    f"item_elapsed={item_elapsed:.2f}s "
+                    f"total_elapsed={format_duration(elapsed)} "
+                    f"eta={format_duration(eta_seconds)}"
+                )
+                continue
+
+            log(f"[WARN] invalid existing file, refetching: {out_path}")
 
         issue_comments = fetch_issue_comments(client, issue["comments_url"])
 
@@ -290,7 +351,6 @@ def export_repo(repo: str, output_dir: Path, token: str, state: str, verbose: bo
             record["pull_request_review_comments"] = review_comments
             record["pull_request_reviews"] = reviews
 
-        out_path = output_dir / f"{kind}_{number:06d}.json"
         safe_write_json(out_path, record)
         elapsed = time.time() - started_at
         speed = index / elapsed if elapsed > 0 else 0.0
@@ -317,6 +377,7 @@ def export_repo(repo: str, output_dir: Path, token: str, state: str, verbose: bo
         f"issue_comments={total_issue_comments} "
         f"pr_review_comments={total_review_comments} "
         f"pr_reviews={total_reviews} "
+        f"resumed_items={resumed_items} "
         f"elapsed={format_duration(total_elapsed)} "
         f"avg_speed={speed:.2f} items/s "
         f"output_dir={output_dir}"
@@ -348,6 +409,11 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Print retry/rate-limit logs to stderr",
     )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Do not reuse existing per-item JSON files; always refetch",
+    )
     return parser.parse_args(argv)
 
 
@@ -367,6 +433,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             token=args.token,
             state=args.state,
             verbose=args.verbose,
+            resume=not args.no_resume,
         )
     except Exception as err:  # noqa: BLE001
         print(f"error: {err}", file=sys.stderr)
