@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
 
 MENTION_PREFIX_RE = re.compile(r"^\s*<@[^>]+>\s*")
+DIRECT_COMMAND_PREFIXES = ("/slack", "/github", "/link", "/links")
 
 
 def build_mention_reply(message_text: str) -> str:
@@ -32,15 +33,13 @@ def extract_mention_command(message_text: str) -> str:
 
 def should_handle_mecromancy_mention(message_text: str) -> bool:
     normalized = extract_mention_command(message_text).lower()
-    return normalized.startswith("/mecromancy") or normalized.startswith("/necromancy")
+    return normalized.startswith(DIRECT_COMMAND_PREFIXES)
 
 
 def build_app_mention_reply(necromancy_sqlite: str | Path, message_text: str) -> str:
     command_text = extract_mention_command(message_text)
-    if command_text.lower().startswith("/necromancy"):
-        command_text = "/mecromancy" + command_text[len("/necromancy") :]
-    if command_text.lower().startswith("/mecromancy"):
-        command_text = command_text[len("/mecromancy") :].strip()
+    if command_text.lower().startswith(DIRECT_COMMAND_PREFIXES):
+        command_text = command_text[1:].strip()
         return handle_mecromancy_command(necromancy_sqlite, command_text)
     return build_mention_reply(message_text)
 
@@ -107,13 +106,31 @@ def create_app(
             thread_ts=resolve_thread_reply_ts(event),
         )
 
-    @app.command("/mecromancy")
-    def handle_mecromancy_slash_command(ack, respond, command) -> None:
+    def handle_direct_slash_command(subcommand: str, ack, respond, command) -> None:
         ack()
-        response_text = handle_mecromancy_command(
-            app.necromancy_sqlite, command.get("text", "")
-        )
+        response_text = handle_mecromancy_command(app.necromancy_sqlite, subcommand)
+        text = command.get("text", "")
+        if text:
+            response_text = handle_mecromancy_command(
+                app.necromancy_sqlite, f"{subcommand} {text}"
+            )
         respond(response_text)
+
+    @app.command("/slack")
+    def handle_slack_slash_command(ack, respond, command) -> None:
+        handle_direct_slash_command("slack", ack, respond, command)
+
+    @app.command("/github")
+    def handle_github_slash_command(ack, respond, command) -> None:
+        handle_direct_slash_command("github", ack, respond, command)
+
+    @app.command("/link")
+    def handle_link_slash_command(ack, respond, command) -> None:
+        handle_direct_slash_command("link", ack, respond, command)
+
+    @app.command("/links")
+    def handle_links_slash_command(ack, respond, command) -> None:
+        handle_direct_slash_command("links", ack, respond, command)
 
     @app.event("message")
     def handle_message_event(event: dict, logger) -> None:

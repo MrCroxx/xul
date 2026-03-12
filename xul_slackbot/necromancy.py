@@ -299,10 +299,10 @@ def format_link_results(rows: Sequence[sqlite3.Row]) -> str:
 def build_mecromancy_usage() -> str:
     return (
         "Usage:\n"
-        "/mecromancy slack <query>\n"
-        "/mecromancy github <query>\n"
-        "/mecromancy links\n"
-        '/mecromancy link "<slack selector>" <github_login>'
+        "/slack <query>\n"
+        "/github <query>\n"
+        "/links\n"
+        '/link "<slack selector>" <github_login>'
     )
 
 

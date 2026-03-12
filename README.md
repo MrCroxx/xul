@@ -31,10 +31,10 @@ uv run slack-bot \
 
 Slash command：
 
-- `/mecromancy slack <query>`：查询 `slack_users` source
-- `/mecromancy github <query>`：查询 `github_users` source
-- `/mecromancy links`：查看当前所有 Slack/GitHub link
-- `/mecromancy link "<slack selector>" <github_login>`：建立或更新 Slack/GitHub link
+- `/slack <query>`：查询 `slack_users` source
+- `/github <query>`：查询 `github_users` source
+- `/links`：查看当前所有 Slack/GitHub link
+- `/link "<slack selector>" <github_login>`：建立或更新 Slack/GitHub link
 
 `link` 在更新前会先检查两个 source 是否都存在对应用户；只有两边都存在时才会写入 `necromancy_links` 表。
 

@@ -44,13 +44,15 @@ class SlackBotTestCase(unittest.TestCase):
 
     def test_extract_mention_command(self) -> None:
         self.assertEqual(
-            extract_mention_command("<@U123> /necromancy github tabversion"),
-            "/necromancy github tabversion",
+            extract_mention_command("<@U123> /github tabversion"),
+            "/github tabversion",
         )
 
-    def test_should_handle_mecromancy_mention_accepts_alias(self) -> None:
-        self.assertTrue(should_handle_mecromancy_mention("<@U123> /mecromancy slack xiang"))
-        self.assertTrue(should_handle_mecromancy_mention("<@U123> /necromancy slack xiang"))
+    def test_should_handle_mecromancy_mention_accepts_direct_commands(self) -> None:
+        self.assertTrue(should_handle_mecromancy_mention("<@U123> /slack xiang"))
+        self.assertTrue(should_handle_mecromancy_mention("<@U123> /github tabversion"))
+        self.assertTrue(should_handle_mecromancy_mention("<@U123> /link xiangyu tabversion"))
+        self.assertTrue(should_handle_mecromancy_mention("<@U123> /links"))
         self.assertFalse(should_handle_mecromancy_mention("<@U123> hello"))
 
     def test_resolve_thread_reply_ts_prefers_existing_thread(self) -> None:
@@ -140,7 +142,7 @@ class SlackBotTestCase(unittest.TestCase):
             github_after_link = handle_mecromancy_command(db_path, "github tabversion")
             self.assertIn("linked_slack=U1", github_after_link)
 
-    def test_build_app_mention_reply_routes_necromancy_alias(self) -> None:
+    def test_build_app_mention_reply_routes_direct_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "necromancy.sqlite"
             conn = connect_necromancy_db(db_path)
@@ -161,7 +163,7 @@ class SlackBotTestCase(unittest.TestCase):
             conn.close()
 
             response = build_app_mention_reply(
-                db_path, "<@U123> /necromancy github tab"
+                db_path, "<@U123> /github tab"
             )
             self.assertIn("GitHub mecromancy results for `tab`:", response)
 
