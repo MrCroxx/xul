@@ -11,3 +11,8 @@ wheels/
 
 # NodeJS Modules
 slack/node_modules/
+
+# Data
+data/
+github_dump/
+slackdump*/
