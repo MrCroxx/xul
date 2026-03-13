@@ -35,7 +35,7 @@ Slash command：
 - `/github <query>`：查询 `github_users` source
 - `/links`：查看当前所有 Slack/GitHub link
 - `/link "<slack selector>" <github_login>`：建立或更新 Slack/GitHub link
-- `/summon <linked_necromancy>`：从已有 link 激活一个 necromancy persona，并为其准备独立 LanceDB 索引
+- `/summon <linked_necromancy>`：在当前 Slack thread 中激活一个来自已有 link 的 necromancy persona，并为其准备独立 LanceDB 索引
 
 `link` 在更新前会先检查两个 source 是否都存在对应用户；只有两边都存在时才会写入 `necromancy_links` 表。
 
@@ -67,8 +67,10 @@ OpenAI 相关配置支持两种来源：
 - 只接受已经通过 `/link` 建立好的 necromancy
 - 在 `./data/user_context_exports/slack` 和 `./data/user_context_exports/github` 下检查目标用户的上下文 dump
 - 如果 dump 不存在，会调用 `scripts/export_slack_user_contexts.py` / `scripts/export_github_user_contexts.py`
-- dump 完成后，会为该 necromancy 重建独立的 LanceDB table，并把它设为当前 active summon
-- 之后非 command 的 `app_mention` 会先从对应 LanceDB table 检索本地上下文，再决定回复
+- dump 完成后，会为该 necromancy 重建独立的 LanceDB table，并把它设为当前 thread 的 active summon
+- active summon 以 Slack thread 为作用域隔离；不同 threads 可以 summon 不同 necromancy，彼此不会互相覆盖
+- 之后该 thread 中的非 command `app_mention` 会先从对应 LanceDB table 检索本地上下文，再决定回复
+- summon persona 的回复会自动带上当前 necromancy 名字前缀，格式为 `<necromancy name>: <reply>`
 - 执行过程中会在 Slack 中持续回报进度，按 10% 分位输出关键阶段
 
 目前实现是本地先查 LanceDB，再调用 OpenAI API 生成回复；也就是说，模型本身不直接访问本地 LanceDB，而是由 bot 在本地做 RAG。`OPENAI_API_KEY` 必须存在于环境变量或 `.env` 中，否则 summon 回复会直接报错。`OPENAI_BASE_URL` 可用于自定义兼容 endpoint。

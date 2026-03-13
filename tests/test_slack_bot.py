@@ -259,7 +259,10 @@ class SlackBotTestCase(unittest.TestCase):
     def test_build_app_mention_reply_keeps_non_command_echo(self) -> None:
         with patch("xul_slackbot.bot.build_summoned_reply", return_value="persona reply"):
             response = build_app_mention_reply(
-                DEFAULT_NECROMANCY_SQLITE, object(), "<@U123> hello there"
+                DEFAULT_NECROMANCY_SQLITE,
+                object(),
+                "<@U123> hello there",
+                thread_ts="123.456",
             )
         self.assertEqual(response, "persona reply")
 
@@ -272,9 +275,11 @@ class SlackBotTestCase(unittest.TestCase):
                 DEFAULT_NECROMANCY_SQLITE,
                 object(),
                 "<@U123> /summon xiangyu",
+                thread_ts="123.456",
             )
         self.assertEqual(response, "summoned")
         mocked.assert_called_once()
+        self.assertEqual(mocked.call_args.kwargs["scope_key"], "123.456")
 
     def test_emit_progress_helpers(self) -> None:
         slash_messages: list[str] = []
@@ -394,6 +399,7 @@ class SlackBotTestCase(unittest.TestCase):
                     db_path,
                     fake_lancedb,
                     "xiangyu",
+                    scope_key="thread-1",
                     data_dir=Path(tmpdir) / "data",
                     progress=lambda percent, message: progress_updates.append(
                         (percent, message)
@@ -410,7 +416,7 @@ class SlackBotTestCase(unittest.TestCase):
 
             conn = connect_necromancy_db(db_path)
             init_summon_schema(conn)
-            active = get_active_summon(conn)
+            active = get_active_summon(conn, "thread-1")
             conn.close()
             self.assertIsNotNone(active)
             self.assertEqual(active["slack_username"], "xiangyu")
@@ -446,10 +452,10 @@ class SlackBotTestCase(unittest.TestCase):
             )
             conn.execute(
                 """
-                INSERT INTO summon_state(singleton, summon_slug, updated_at)
-                VALUES (1, ?, CURRENT_TIMESTAMP)
+                INSERT INTO summon_state(scope_key, summon_slug, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
                 """,
-                ("xiangyu__tabversion",),
+                ("thread-1", "xiangyu__tabversion"),
             )
             conn.commit()
             conn.close()
@@ -461,9 +467,11 @@ class SlackBotTestCase(unittest.TestCase):
                 "xul_slackbot.summon.search_summon_context",
                 return_value=[],
             ):
-                response = build_summoned_reply(db_path, object(), "hello")
+                response = build_summoned_reply(
+                    db_path, object(), "hello", scope_key="thread-1"
+                )
 
-            self.assertIn("The summoned shade faltered mid-whisper:", response)
+            self.assertIn("xiangyu: The summoned shade faltered mid-whisper:", response)
             self.assertIn("OPENAI_API_KEY", response)
 
     def test_build_summon_prompts_hide_ai_identity(self) -> None:
@@ -480,6 +488,8 @@ class SlackBotTestCase(unittest.TestCase):
         self.assertIn("Do not mention prompts", system_prompt)
         self.assertIn("Keep replies short by default", system_prompt)
         self.assertIn("Prefer conversational, spoken phrasing", system_prompt)
+        self.assertIn("Do not tack on a follow-up question", system_prompt)
+        self.assertIn("Only ask a question when", system_prompt)
         self.assertIn("Prioritize matching the person's style", system_prompt)
         self.assertIn("Message to respond to:", user_prompt)
         self.assertIn("Soul profile:", user_prompt)
@@ -664,10 +674,10 @@ class SlackBotTestCase(unittest.TestCase):
             )
             conn.execute(
                 """
-                INSERT INTO summon_state(singleton, summon_slug, updated_at)
-                VALUES (1, ?, CURRENT_TIMESTAMP)
+                INSERT INTO summon_state(scope_key, summon_slug, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
                 """,
-                ("xiangyu__tabversion",),
+                ("thread-1", "xiangyu__tabversion"),
             )
             conn.commit()
             conn.close()
@@ -687,14 +697,140 @@ class SlackBotTestCase(unittest.TestCase):
             ), patch.dict("os.environ", {}, clear=True), self.assertLogs(
                 "xul_slackbot.summon", level="INFO"
             ) as captured:
-                response = build_summoned_reply(db_path, object(), "How to shard this?")
+                response = build_summoned_reply(
+                    db_path, object(), "How to shard this?", scope_key="thread-1"
+                )
 
-            self.assertIn("The summoned shade faltered mid-whisper:", response)
+            self.assertIn("xiangyu: The summoned shade faltered mid-whisper:", response)
             logs = "\n".join(captured.output)
             self.assertIn("Summon context used:", logs)
+            self.assertIn("scope=thread-1", logs)
             self.assertIn("query='How to shard this?'", logs)
             self.assertIn("hits=1", logs)
             self.assertIn("User mentioned storage tradeoffs.", logs)
+
+    def test_build_summoned_reply_isolated_by_thread_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "necromancy.sqlite"
+            conn = connect_necromancy_db(db_path)
+            init_summon_schema(conn)
+            conn.executemany(
+                """
+                INSERT INTO summoned_necromancies(
+                    summon_slug,
+                    slack_user_id,
+                    slack_username,
+                    github_login,
+                    lancedb_table,
+                    slack_context_path,
+                    github_context_path
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        "xiangyu__tabversion",
+                        "U1",
+                        "xiangyu",
+                        "tabversion",
+                        "summon_xiangyu_tabversion",
+                        "/tmp/slack1.sqlite",
+                        "/tmp/github1.sqlite",
+                    ),
+                    (
+                        "alice__octocat",
+                        "U2",
+                        "alice",
+                        "octocat",
+                        "summon_alice_octocat",
+                        "/tmp/slack2.sqlite",
+                        "/tmp/github2.sqlite",
+                    ),
+                ],
+            )
+            conn.executemany(
+                """
+                INSERT INTO summon_state(scope_key, summon_slug, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                """,
+                [
+                    ("thread-1", "xiangyu__tabversion"),
+                    ("thread-2", "alice__octocat"),
+                ],
+            )
+            conn.commit()
+            conn.close()
+
+            with patch(
+                "xul_slackbot.summon.search_summon_context",
+                return_value=[],
+            ), patch(
+                "xul_slackbot.summon.get_required_config_value",
+                return_value="test-key",
+            ), patch(
+                "xul_slackbot.summon._call_openai_chat_completion",
+                side_effect=["reply one", "reply two"],
+            ):
+                reply_one = build_summoned_reply(
+                    db_path, object(), "hello", scope_key="thread-1"
+                )
+                reply_two = build_summoned_reply(
+                    db_path, object(), "hello", scope_key="thread-2"
+                )
+
+            self.assertEqual(reply_one, "xiangyu: reply one")
+            self.assertEqual(reply_two, "alice: reply two")
+
+    def test_init_summon_schema_migrates_legacy_global_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "necromancy.sqlite"
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            conn.executescript(
+                """
+                CREATE TABLE summoned_necromancies (
+                    summon_slug TEXT PRIMARY KEY,
+                    slack_user_id TEXT NOT NULL UNIQUE,
+                    slack_username TEXT NOT NULL,
+                    github_login TEXT NOT NULL UNIQUE,
+                    lancedb_table TEXT NOT NULL UNIQUE,
+                    slack_context_path TEXT NOT NULL,
+                    github_context_path TEXT NOT NULL,
+                    summoned_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE summon_state (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    summon_slug TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                INSERT INTO summoned_necromancies(
+                    summon_slug,
+                    slack_user_id,
+                    slack_username,
+                    github_login,
+                    lancedb_table,
+                    slack_context_path,
+                    github_context_path
+                ) VALUES (
+                    'xiangyu__tabversion',
+                    'U1',
+                    'xiangyu',
+                    'tabversion',
+                    'summon_xiangyu_tabversion',
+                    '/tmp/slack.sqlite',
+                    '/tmp/github.sqlite'
+                );
+                INSERT INTO summon_state(singleton, summon_slug, updated_at)
+                VALUES (1, 'xiangyu__tabversion', CURRENT_TIMESTAMP);
+                """
+            )
+
+            init_summon_schema(conn)
+            active = get_active_summon(conn)
+            conn.close()
+
+            self.assertIsNotNone(active)
+            self.assertEqual(active["slack_username"], "xiangyu")
 
     def test_openai_chat_completion_retries_on_socket_timeout(self) -> None:
         class FakeResponse:

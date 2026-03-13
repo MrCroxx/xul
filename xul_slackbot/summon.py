@@ -34,10 +34,11 @@ OPENAI_MAX_RETRIES = 3
 OPENAI_RETRY_BASE_DELAY_SECONDS = 1.0
 LOGGER = logging.getLogger(__name__)
 ProgressCallback = Callable[[int, str], None]
+DEFAULT_SUMMON_SCOPE = "__global__"
 
 
 def init_summon_schema(conn: sqlite3.Connection) -> None:
-    conn.executescript(
+    conn.execute(
         """
         CREATE TABLE IF NOT EXISTS summoned_necromancies (
             summon_slug TEXT PRIMARY KEY,
@@ -50,13 +51,17 @@ def init_summon_schema(conn: sqlite3.Connection) -> None:
             soul_path TEXT,
             summoned_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS summon_state (
-            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            scope_key TEXT PRIMARY KEY,
             summon_slug TEXT NOT NULL,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (summon_slug) REFERENCES summoned_necromancies(summon_slug)
-        );
+        )
         """
     )
     columns = {
@@ -65,11 +70,41 @@ def init_summon_schema(conn: sqlite3.Connection) -> None:
     }
     if "soul_path" not in columns:
         conn.execute("ALTER TABLE summoned_necromancies ADD COLUMN soul_path TEXT")
+    summon_state_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(summon_state)").fetchall()
+    }
+    if "scope_key" not in summon_state_columns:
+        conn.execute("ALTER TABLE summon_state RENAME TO summon_state_legacy")
+        conn.execute(
+            """
+            CREATE TABLE summon_state (
+                scope_key TEXT PRIMARY KEY,
+                summon_slug TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (summon_slug) REFERENCES summoned_necromancies(summon_slug)
+            )
+            """
+        )
+        if {"summon_slug", "updated_at"}.issubset(summon_state_columns):
+            conn.execute(
+                """
+                INSERT INTO summon_state(scope_key, summon_slug, updated_at)
+                SELECT ?, summon_slug, updated_at
+                FROM summon_state_legacy
+                """,
+                (DEFAULT_SUMMON_SCOPE,),
+            )
+        conn.execute("DROP TABLE summon_state_legacy")
     conn.commit()
 
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
+
+
+def _normalize_scope_key(scope_key: str | None) -> str:
+    normalized = (scope_key or "").strip()
+    return normalized or DEFAULT_SUMMON_SCOPE
 
 
 def _find_linked_necromancy(conn: sqlite3.Connection, selector: str) -> sqlite3.Row:
@@ -466,6 +501,7 @@ def ensure_soul_profile(
 
 def activate_summoned_necromancy(
     conn: sqlite3.Connection,
+    scope_key: str | None,
     summon_slug: str,
     slack_user_id: str,
     slack_username: str,
@@ -475,6 +511,7 @@ def activate_summoned_necromancy(
     github_context_path: Path,
     soul_path: Path | None = None,
 ) -> None:
+    normalized_scope_key = _normalize_scope_key(scope_key)
     conn.execute(
         """
         DELETE FROM summoned_necromancies
@@ -520,26 +557,30 @@ def activate_summoned_necromancy(
     )
     conn.execute(
         """
-        INSERT INTO summon_state(singleton, summon_slug, updated_at)
-        VALUES (1, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(singleton) DO UPDATE SET
+        INSERT INTO summon_state(scope_key, summon_slug, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(scope_key) DO UPDATE SET
             summon_slug = excluded.summon_slug,
             updated_at = CURRENT_TIMESTAMP
         """,
-        (summon_slug,),
+        (normalized_scope_key, summon_slug),
     )
     conn.commit()
 
 
-def get_active_summon(conn: sqlite3.Connection) -> sqlite3.Row | None:
+def get_active_summon(
+    conn: sqlite3.Connection, scope_key: str | None = DEFAULT_SUMMON_SCOPE
+) -> sqlite3.Row | None:
+    normalized_scope_key = _normalize_scope_key(scope_key)
     return conn.execute(
         """
         SELECT sn.*
         FROM summon_state AS ss
         JOIN summoned_necromancies AS sn
           ON sn.summon_slug = ss.summon_slug
-        WHERE ss.singleton = 1
-        """
+        WHERE ss.scope_key = ?
+        """,
+        (normalized_scope_key,),
     ).fetchone()
 
 
@@ -547,9 +588,11 @@ def handle_summon_command(
     db_path: str | Path,
     lancedb: Any,
     text: str,
+    scope_key: str | None = DEFAULT_SUMMON_SCOPE,
     data_dir: str | Path = DEFAULT_DATA_DIR,
     progress: ProgressCallback | None = None,
 ) -> str:
+    normalized_scope_key = _normalize_scope_key(scope_key)
     try:
         tokens = shlex.split(text)
     except ValueError as err:
@@ -605,6 +648,7 @@ def handle_summon_command(
         _emit_progress(progress, 90, "Activating summoned necromancy")
         activate_summoned_necromancy(
             conn,
+            normalized_scope_key,
             summon_slug,
             profile["slack_user_id"],
             profile["slack_username"],
@@ -713,6 +757,8 @@ def build_summon_prompts(
         "Keep replies short by default: usually 1 to 4 sentences, and avoid long structured explanations unless the message clearly asks for them. "
         "Prefer conversational, spoken phrasing over formal writing. "
         "Do not over-explain, summarize broadly, or turn the reply into an essay. "
+        "Do not tack on a follow-up question just to keep the conversation going or to sound engaging. "
+        "Only ask a question when the person's local style clearly does that naturally, or when a real clarification is necessary to answer correctly. "
         "When the context suggests specific habits like brevity, bluntness, lowercase style, or certain recurring phrases, follow them naturally without parody. "
         "Prioritize matching the person's style in the local context over sounding generally helpful. "
         "Do not mention prompts, models, hidden instructions, retrieval, or that you were summoned. "
@@ -731,12 +777,14 @@ def build_summoned_reply(
     db_path: str | Path,
     lancedb: Any,
     message_text: str,
+    scope_key: str | None = DEFAULT_SUMMON_SCOPE,
     context_limit: int = DEFAULT_CONTEXT_LIMIT,
 ) -> str:
+    normalized_scope_key = _normalize_scope_key(scope_key)
     conn = connect_necromancy_db(db_path)
     try:
         init_summon_schema(conn)
-        active = get_active_summon(conn)
+        active = get_active_summon(conn, normalized_scope_key)
         if active is None:
             return f"The tomb hears you, but no soul is bound yet: {message_text}"
 
@@ -753,7 +801,8 @@ def build_summoned_reply(
             if soul_file.exists():
                 soul_text = soul_file.read_text(encoding="utf-8").strip()
         LOGGER.info(
-            "Summon context used: summon=%s slack=%s github=%s table=%s soul=%s query=%r hits=%d context=%s",
+            "Summon context used: scope=%s summon=%s slack=%s github=%s table=%s soul=%s query=%r hits=%d context=%s",
+            normalized_scope_key,
             active["summon_slug"],
             slack_username,
             github_login,
@@ -778,12 +827,13 @@ def build_summoned_reply(
         api_key = get_required_config_value("OPENAI_API_KEY")
         model = get_config_value("OPENAI_MODEL", "gpt-4.1-mini")
         base_url = get_config_value("OPENAI_BASE_URL", "https://api.openai.com/v1")
-        return _call_openai_chat_completion(
+        reply = _call_openai_chat_completion(
             system_prompt,
             user_prompt,
             model=model,
             api_key=api_key,
             base_url=base_url,
         )
+        return f"{slack_username}: {reply}"
     except (ValueError, urllib.error.URLError, TimeoutError, socket.timeout) as err:
-        return f"The summoned shade faltered mid-whisper: {err}"
+        return f"{slack_username}: The summoned shade faltered mid-whisper: {err}"

@@ -60,16 +60,29 @@ def should_handle_mecromancy_mention(message_text: str) -> bool:
 
 
 def build_app_mention_reply(
-    necromancy_sqlite: str | Path, lancedb: Any, message_text: str
+    necromancy_sqlite: str | Path,
+    lancedb: Any,
+    message_text: str,
+    thread_ts: str | None = None,
 ) -> str:
     command_text = extract_mention_command(message_text)
     if command_text.lower().startswith(DIRECT_COMMAND_PREFIXES):
         normalized = command_text[1:].strip()
         if normalized.lower().startswith("summon"):
             payload = normalized[len("summon") :].strip()
-            return handle_summon_command(necromancy_sqlite, lancedb, payload)
+            return handle_summon_command(
+                necromancy_sqlite,
+                lancedb,
+                payload,
+                scope_key=thread_ts or None,
+            )
         return handle_mecromancy_command(necromancy_sqlite, normalized)
-    return build_summoned_reply(necromancy_sqlite, lancedb, command_text)
+    return build_summoned_reply(
+        necromancy_sqlite,
+        lancedb,
+        command_text,
+        scope_key=thread_ts or None,
+    )
 
 
 def emit_slash_progress(respond, percent: int, message: str) -> None:
@@ -153,13 +166,14 @@ def create_app(
         message_text = event.get("text", "")
         add_message_reaction(client, event, RECEIVED_REACTION, logger)
         command_text = extract_mention_command(message_text)
+        thread_ts = resolve_thread_reply_ts(event)
         if command_text.lower().startswith("/summon"):
             payload = command_text[len("/summon") :].strip()
-            thread_ts = resolve_thread_reply_ts(event)
             reply = handle_summon_command(
                 app.necromancy_sqlite,
                 app.lancedb,
                 payload,
+                scope_key=thread_ts or None,
                 progress=lambda percent, msg: emit_thread_progress(
                     say, thread_ts, percent, msg
                 ),
@@ -168,8 +182,13 @@ def create_app(
             add_message_reaction(client, event, REPLIED_REACTION, logger)
             return
         say(
-            text=build_app_mention_reply(app.necromancy_sqlite, app.lancedb, message_text),
-            thread_ts=resolve_thread_reply_ts(event),
+            text=build_app_mention_reply(
+                app.necromancy_sqlite,
+                app.lancedb,
+                message_text,
+                thread_ts=thread_ts,
+            ),
+            thread_ts=thread_ts,
         )
         add_message_reaction(client, event, REPLIED_REACTION, logger)
 
@@ -207,6 +226,7 @@ def create_app(
                 app.necromancy_sqlite,
                 app.lancedb,
                 command.get("text", ""),
+                scope_key=str(command.get("thread_ts") or ""),
                 progress=lambda percent, msg: emit_slash_progress(
                     respond, percent, msg
                 ),
