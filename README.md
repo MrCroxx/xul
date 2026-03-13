@@ -289,3 +289,9 @@ python3 scripts/export_github_user_contexts.py \
 - `metadata`
 - `contexts`
 - `events`
+
+## Dive into Xul
+
+![Dive into Xul](assets/xul-intro-en.png)
+
+![Dive into Xul](assets/xul-intro-zh.png)
