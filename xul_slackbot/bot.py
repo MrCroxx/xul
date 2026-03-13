@@ -28,7 +28,26 @@ REPLIED_REACTION = "smiling_imp"
 
 
 def build_mention_reply(message_text: str) -> str:
-    return f"Received: {message_text}"
+    return f"The necromancer hears the invocation: {message_text}"
+
+
+def format_xul_progress(message: str) -> str:
+    templates = {
+        "Resolving linked necromancy": "Xul traces the name through ash and old pacts, seeking the soul bound to your call.",
+        "Checking local context dumps": "Xul parts the grave dust and inspects the relics already sealed in the catacombs.",
+        "Context dumps already exist": "The relics are already laid upon the altar. No fresh exhumation is needed.",
+        "Exporting Slack context dump": "Xul lowers a hook into the Slack catacombs and drags old voices toward the surface.",
+        "Exporting GitHub context dump": "Xul scrapes the runes from GitHub's iron tablets and gathers them for the rite.",
+        "Context dumps are ready": "The bones and fragments are assembled. The chamber is ready for deeper craft.",
+        "Building soul profile": "Xul presses the stolen voices into a black grimoire, distilling cadence from memory.",
+        "Building isolated LanceDB table": "Xul raises a private crypt of indices so the shade may hunt its own memories.",
+        "Activating summoned necromancy": "Xul seals the rite with grave-salt and bids the shade take its seat upon the throne of whispers.",
+        "Summon completed": "The candles gutter. The pact holds. The dead now answer when called.",
+    }
+    return templates.get(
+        message,
+        f"Xul murmurs over the ritual circle: {message}",
+    )
 
 
 def extract_mention_command(message_text: str) -> str:
@@ -54,11 +73,11 @@ def build_app_mention_reply(
 
 
 def emit_slash_progress(respond, percent: int, message: str) -> None:
-    respond(f"[{percent}%] {message}")
+    respond(format_xul_progress(message))
 
 
 def emit_thread_progress(say, thread_ts: str | None, percent: int, message: str) -> None:
-    say(text=f"[{percent}%] {message}", thread_ts=thread_ts)
+    say(text=format_xul_progress(message), thread_ts=thread_ts)
 
 
 def add_message_reaction(client: Any, event: dict, reaction: str, logger: logging.Logger) -> None:

@@ -1,5 +1,7 @@
 import logging
 import os
+import sqlite3
+import socket
 import sys
 import tempfile
 import unittest
@@ -20,6 +22,7 @@ from xul_slackbot.bot import (
     emit_slash_progress,
     emit_thread_progress,
     extract_mention_command,
+    format_xul_progress,
     resolve_thread_reply_ts,
     should_handle_mecromancy_mention,
     should_ignore_message_event,
@@ -28,11 +31,14 @@ from xul_slackbot.lancedb import connect_lancedb
 from xul_slackbot.logging import configure_logging
 from xul_slackbot.necromancy import connect_necromancy_db, handle_mecromancy_command
 from xul_slackbot.summon import (
+    _call_openai_chat_completion,
     build_summon_prompts,
     build_summoned_reply,
+    collect_soul_quotes,
     get_active_summon,
     handle_summon_command,
     init_summon_schema,
+    render_soul_markdown,
 )
 
 
@@ -55,7 +61,7 @@ class SlackBotTestCase(unittest.TestCase):
     def test_build_mention_reply(self) -> None:
         self.assertEqual(
             build_mention_reply("<@U123> hello"),
-            "Received: <@U123> hello",
+            "The necromancer hears the invocation: <@U123> hello",
         )
 
     def test_extract_mention_command(self) -> None:
@@ -284,11 +290,24 @@ class SlackBotTestCase(unittest.TestCase):
 
         self.assertEqual(
             slash_messages,
-            ["[30%] Checking local context dumps"],
+            [
+                "Xul parts the grave dust and inspects the relics already sealed in the catacombs."
+            ],
         )
         self.assertEqual(
             thread_messages,
-            [("[70%] Building isolated LanceDB table", "123.456")],
+            [
+                (
+                    "Xul raises a private crypt of indices so the shade may hunt its own memories.",
+                    "123.456",
+                )
+            ],
+        )
+
+    def test_format_xul_progress_uses_fallback_for_unknown_message(self) -> None:
+        self.assertEqual(
+            format_xul_progress("Unmapped step"),
+            "Xul murmurs over the ritual circle: Unmapped step",
         )
 
     def test_add_message_reaction_uses_slack_client(self) -> None:
@@ -364,6 +383,9 @@ class SlackBotTestCase(unittest.TestCase):
                 "xul_slackbot.summon.ensure_context_dumps",
                 return_value=(slack_dump, github_dump),
             ), patch(
+                "xul_slackbot.summon.ensure_soul_profile",
+                return_value=Path(tmpdir) / "data" / "souls" / "soul_xiangyu__tabversion.md",
+            ), patch(
                 "xul_slackbot.summon.ensure_summon_lancedb_table",
                 return_value=("summon_xiangyu_tabversion", 7),
             ):
@@ -378,8 +400,9 @@ class SlackBotTestCase(unittest.TestCase):
                     ),
                 )
 
-            self.assertIn("Summoned necromancy:", response)
+            self.assertIn("The rite is complete.", response)
             self.assertIn("documents: 7", response)
+            self.assertIn("soul:", response)
             self.assertEqual(
                 [percent for percent, _ in progress_updates],
                 [10, 20, 30, 40, 50, 60, 70, 80, 90, 100],
@@ -392,6 +415,7 @@ class SlackBotTestCase(unittest.TestCase):
             self.assertIsNotNone(active)
             self.assertEqual(active["slack_username"], "xiangyu")
             self.assertEqual(active["github_login"], "tabversion")
+            self.assertIn("soul_xiangyu__tabversion.md", active["soul_path"])
 
     def test_build_summoned_reply_requires_openai_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -439,7 +463,7 @@ class SlackBotTestCase(unittest.TestCase):
             ):
                 response = build_summoned_reply(db_path, object(), "hello")
 
-            self.assertIn("Summon reply failed:", response)
+            self.assertIn("The summoned shade faltered mid-whisper:", response)
             self.assertIn("OPENAI_API_KEY", response)
 
     def test_build_summon_prompts_hide_ai_identity(self) -> None:
@@ -448,6 +472,7 @@ class SlackBotTestCase(unittest.TestCase):
             "tabversion",
             "How would you approach this?",
             "Local context here",
+            "## Voice Summary\n- terse",
         )
 
         self.assertIn("You are xiangyu.", system_prompt)
@@ -457,7 +482,158 @@ class SlackBotTestCase(unittest.TestCase):
         self.assertIn("Prefer conversational, spoken phrasing", system_prompt)
         self.assertIn("Prioritize matching the person's style", system_prompt)
         self.assertIn("Message to respond to:", user_prompt)
+        self.assertIn("Soul profile:", user_prompt)
+        self.assertIn("## Voice Summary", user_prompt)
         self.assertIn("Local context about you:", user_prompt)
+
+    def test_render_soul_markdown_includes_quotes(self) -> None:
+        quotes = [
+            {"source": "slack", "ref": f"slack:general:{index}", "text": f"quote line {index} with enough words"}
+            for index in range(1, 22)
+        ]
+
+        with patch("xul_slackbot.summon.get_config_value", return_value=""):
+            markdown = render_soul_markdown("xiangyu", "tabversion", quotes)
+
+        self.assertIn("# Soul Profile: xiangyu / tabversion", markdown)
+        self.assertIn("## Original Quotes", markdown)
+        self.assertGreaterEqual(markdown.count('[slack] "quote line'), 21)
+
+    def test_collect_soul_quotes_reads_authored_slack_and_github_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            slack_path = Path(tmpdir) / "slack.sqlite"
+            github_path = Path(tmpdir) / "github.sqlite"
+
+            slack_conn = sqlite3.connect(slack_path)
+            slack_conn.row_factory = sqlite3.Row
+            slack_conn.executescript(
+                """
+                CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE channels (channel_id TEXT PRIMARY KEY, name TEXT NOT NULL, raw_json TEXT NOT NULL);
+                CREATE TABLE messages (
+                    context_key TEXT NOT NULL,
+                    channel_id TEXT NOT NULL,
+                    ts TEXT NOT NULL,
+                    thread_ts TEXT,
+                    user_id TEXT,
+                    subtype TEXT,
+                    text TEXT NOT NULL,
+                    is_direct_match INTEGER NOT NULL,
+                    raw_json TEXT NOT NULL,
+                    PRIMARY KEY (context_key, channel_id, ts)
+                );
+                """
+            )
+            slack_conn.execute(
+                "INSERT INTO metadata(key, value) VALUES ('target_user_id', 'U1')"
+            )
+            slack_conn.execute(
+                "INSERT INTO channels(channel_id, name, raw_json) VALUES ('C1', 'general', '{}')"
+            )
+            for index in range(1, 13):
+                slack_conn.execute(
+                    """
+                    INSERT INTO messages(
+                        context_key, channel_id, ts, thread_ts, user_id, subtype, text, is_direct_match, raw_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        f"message:C1:{100 + index}.0",
+                        "C1",
+                        f"{100 + index}.0",
+                        None,
+                        "U1",
+                        None,
+                        f"slack authored quote number {index} with enough words to keep",
+                        1,
+                        "{}",
+                    ),
+                )
+            slack_conn.commit()
+            slack_conn.close()
+
+            github_conn = sqlite3.connect(github_path)
+            github_conn.row_factory = sqlite3.Row
+            github_conn.executescript(
+                """
+                CREATE TABLE contexts (
+                    context_id TEXT PRIMARY KEY,
+                    repo TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    number INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    state TEXT,
+                    html_url TEXT,
+                    author_login TEXT,
+                    matched INTEGER NOT NULL DEFAULT 0,
+                    match_reasons TEXT NOT NULL,
+                    raw_json TEXT NOT NULL
+                );
+                CREATE TABLE events (
+                    context_id TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    author_login TEXT,
+                    created_at TEXT,
+                    body TEXT,
+                    html_url TEXT,
+                    matched INTEGER NOT NULL,
+                    match_reason TEXT,
+                    raw_json TEXT NOT NULL,
+                    PRIMARY KEY (context_id, event_id)
+                );
+                """
+            )
+            for index in range(1, 13):
+                context_id = f"ctx-{index}"
+                github_conn.execute(
+                    """
+                    INSERT INTO contexts(
+                        context_id, repo, kind, number, title, state, html_url, author_login, matched, match_reasons, raw_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        context_id,
+                        "acme/repo",
+                        "issue",
+                        index,
+                        f"title {index}",
+                        "open",
+                        "",
+                        "tabversion",
+                        1,
+                        "author",
+                        "{}",
+                    ),
+                )
+                github_conn.execute(
+                    """
+                    INSERT INTO events(
+                        context_id, event_id, event_type, author_login, created_at, body, html_url, matched, match_reason, raw_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        context_id,
+                        f"event-{index}",
+                        "issue_comment",
+                        "tabversion",
+                        f"2026-03-{index:02d}T00:00:00Z",
+                        f"github authored quote number {index} with enough words to keep",
+                        "",
+                        1,
+                        "issue_comment_author",
+                        "{}",
+                    ),
+                )
+            github_conn.commit()
+            github_conn.close()
+
+            quotes = collect_soul_quotes(slack_path, github_path)
+
+            self.assertGreaterEqual(len(quotes), 20)
+            sources = {quote["source"] for quote in quotes}
+            self.assertIn("slack", sources)
+            self.assertIn("github", sources)
 
     def test_build_summoned_reply_logs_used_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -513,12 +689,43 @@ class SlackBotTestCase(unittest.TestCase):
             ) as captured:
                 response = build_summoned_reply(db_path, object(), "How to shard this?")
 
-            self.assertIn("Summon reply failed:", response)
+            self.assertIn("The summoned shade faltered mid-whisper:", response)
             logs = "\n".join(captured.output)
             self.assertIn("Summon context used:", logs)
             self.assertIn("query='How to shard this?'", logs)
             self.assertIn("hits=1", logs)
             self.assertIn("User mentioned storage tradeoffs.", logs)
+
+    def test_openai_chat_completion_retries_on_socket_timeout(self) -> None:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self) -> bytes:
+                return b'{"choices":[{"message":{"content":"rise"}}]}'
+
+        side_effects = [socket.timeout("read timed out"), FakeResponse()]
+
+        with patch(
+            "xul_slackbot.summon.urllib.request.urlopen",
+            side_effect=side_effects,
+        ) as mocked_urlopen, patch("xul_slackbot.summon.time.sleep") as mocked_sleep:
+            result = _call_openai_chat_completion(
+                "system",
+                "user",
+                model="gpt-4.1-mini",
+                api_key="test-key",
+                base_url="https://api.openai.com/v1",
+                timeout=0.01,
+                max_retries=2,
+            )
+
+        self.assertEqual(result, "rise")
+        self.assertEqual(mocked_urlopen.call_count, 2)
+        mocked_sleep.assert_called_once()
 
 
 if __name__ == "__main__":
