@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence
 
 from xul_slackbot.lancedb import connect_lancedb
+from xul_slackbot.logging import configure_logging
 from xul_slackbot.necromancy import connect_necromancy_db, handle_mecromancy_command
 from xul_slackbot.summon import build_summoned_reply, handle_summon_command, init_summon_schema
 
@@ -206,7 +207,7 @@ def create_app(
 def main(argv: Sequence[str] | None = None) -> None:
     from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
+    configure_logging()
     args = build_arg_parser().parse_args(argv)
     app_token = os.environ["SLACK_APP_TOKEN"]
     app = create_app(

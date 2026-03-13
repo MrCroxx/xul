@@ -1,3 +1,5 @@
+import logging
+import os
 import sys
 import tempfile
 import unittest
@@ -23,6 +25,7 @@ from xul_slackbot.bot import (
     should_ignore_message_event,
 )
 from xul_slackbot.lancedb import connect_lancedb
+from xul_slackbot.logging import configure_logging
 from xul_slackbot.necromancy import connect_necromancy_db, handle_mecromancy_command
 from xul_slackbot.summon import (
     build_summon_prompts,
@@ -99,6 +102,42 @@ class SlackBotTestCase(unittest.TestCase):
             self.assertTrue(db_dir.exists())
             self.assertEqual(connect_calls, [str(db_dir.resolve())])
             self.assertEqual(result, {"uri": str(db_dir.resolve())})
+
+    def test_configure_logging_installs_root_handler(self) -> None:
+        root_logger = logging.getLogger()
+        previous_handlers = list(root_logger.handlers)
+        previous_level = root_logger.level
+        try:
+            configure_logging()
+            self.assertGreaterEqual(len(root_logger.handlers), 1)
+        finally:
+            root_logger.handlers.clear()
+            for handler in previous_handlers:
+                root_logger.addHandler(handler)
+            root_logger.setLevel(previous_level)
+
+    def test_configure_logging_reads_level_from_dotenv(self) -> None:
+        root_logger = logging.getLogger()
+        previous_handlers = list(root_logger.handlers)
+        previous_level = root_logger.level
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+                "os.environ", {}, clear=True
+            ):
+                dotenv_path = Path(tmpdir) / ".env"
+                dotenv_path.write_text("LOG_LEVEL=DEBUG\n", encoding="utf-8")
+                previous_cwd = Path.cwd()
+                os.chdir(tmpdir)
+                try:
+                    configure_logging()
+                finally:
+                    os.chdir(previous_cwd)
+                self.assertEqual(root_logger.level, logging.DEBUG)
+        finally:
+            root_logger.handlers.clear()
+            for handler in previous_handlers:
+                root_logger.addHandler(handler)
+            root_logger.setLevel(previous_level)
 
     def test_config_prefers_environment_then_dotenv(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -414,8 +453,72 @@ class SlackBotTestCase(unittest.TestCase):
         self.assertIn("You are xiangyu.", system_prompt)
         self.assertIn("not as an AI assistant", system_prompt)
         self.assertIn("Do not mention prompts", system_prompt)
+        self.assertIn("Keep replies short by default", system_prompt)
+        self.assertIn("Prefer conversational, spoken phrasing", system_prompt)
+        self.assertIn("Prioritize matching the person's style", system_prompt)
         self.assertIn("Message to respond to:", user_prompt)
         self.assertIn("Local context about you:", user_prompt)
+
+    def test_build_summoned_reply_logs_used_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "necromancy.sqlite"
+            conn = connect_necromancy_db(db_path)
+            init_summon_schema(conn)
+            conn.execute(
+                """
+                INSERT INTO summoned_necromancies(
+                    summon_slug,
+                    slack_user_id,
+                    slack_username,
+                    github_login,
+                    lancedb_table,
+                    slack_context_path,
+                    github_context_path
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "xiangyu__tabversion",
+                    "U1",
+                    "xiangyu",
+                    "tabversion",
+                    "summon_xiangyu_tabversion",
+                    "/tmp/slack.sqlite",
+                    "/tmp/github.sqlite",
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO summon_state(singleton, summon_slug, updated_at)
+                VALUES (1, ?, CURRENT_TIMESTAMP)
+                """,
+                ("xiangyu__tabversion",),
+            )
+            conn.commit()
+            conn.close()
+
+            with patch(
+                "xul_slackbot.summon.search_summon_context",
+                return_value=[
+                    {
+                        "source": "slack",
+                        "title": "Slack general direct",
+                        "text": "User mentioned storage tradeoffs.",
+                    }
+                ],
+            ), patch(
+                "xul_slackbot.summon.get_required_config_value",
+                side_effect=ValueError("Missing required `OPENAI_API_KEY`."),
+            ), patch.dict("os.environ", {}, clear=True), self.assertLogs(
+                "xul_slackbot.summon", level="INFO"
+            ) as captured:
+                response = build_summoned_reply(db_path, object(), "How to shard this?")
+
+            self.assertIn("Summon reply failed:", response)
+            logs = "\n".join(captured.output)
+            self.assertIn("Summon context used:", logs)
+            self.assertIn("query='How to shard this?'", logs)
+            self.assertIn("hits=1", logs)
+            self.assertIn("User mentioned storage tradeoffs.", logs)
 
 
 if __name__ == "__main__":

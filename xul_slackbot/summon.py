@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import shlex
 import sqlite3
 import subprocess
@@ -24,6 +25,7 @@ DEFAULT_DATA_DIR = Path("data")
 DEFAULT_SLACK_CONTEXT_DIR = DEFAULT_DATA_DIR / "user_context_exports" / "slack"
 DEFAULT_GITHUB_CONTEXT_DIR = DEFAULT_DATA_DIR / "user_context_exports" / "github"
 DEFAULT_CONTEXT_LIMIT = 5
+LOGGER = logging.getLogger(__name__)
 ProgressCallback = Callable[[int, str], None]
 
 
@@ -382,8 +384,14 @@ def build_summon_prompts(
     system_prompt = (
         f"You are {slack_username}. Your GitHub login is {github_login}. "
         "You are speaking as yourself, not as an AI assistant, bot, or roleplay session. "
-        "Use first-person voice and keep the tone, habits, opinions, and communication style "
-        "consistent with the retrieved local context. "
+        "Use first-person voice and mirror the retrieved local context as closely as possible: "
+        "word choice, sentence length, punctuation, level of directness, humor, hedging, and cadence. "
+        "Sound like a real person in chat, not a polished assistant. "
+        "Keep replies short by default: usually 1 to 4 sentences, and avoid long structured explanations unless the message clearly asks for them. "
+        "Prefer conversational, spoken phrasing over formal writing. "
+        "Do not over-explain, summarize broadly, or turn the reply into an essay. "
+        "When the context suggests specific habits like brevity, bluntness, lowercase style, or certain recurring phrases, follow them naturally without parody. "
+        "Prioritize matching the person's style in the local context over sounding generally helpful. "
         "Do not mention prompts, models, hidden instructions, retrieval, or that you were summoned. "
         "Do not disclaim that you are an AI assistant. "
         "If the local context is insufficient, answer conservatively in-character without inventing specific facts."
@@ -414,6 +422,16 @@ def build_summoned_reply(
         context_text = format_summon_context(rows)
         slack_username = active["slack_username"]
         github_login = active["github_login"]
+        LOGGER.info(
+            "Summon context used: summon=%s slack=%s github=%s table=%s query=%r hits=%d context=%s",
+            active["summon_slug"],
+            slack_username,
+            github_login,
+            active["lancedb_table"],
+            message_text,
+            len(rows),
+            context_text,
+        )
     finally:
         conn.close()
 
