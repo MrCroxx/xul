@@ -10,7 +10,13 @@ from typing import TYPE_CHECKING, Any, Sequence
 from xul_slackbot.lancedb import connect_lancedb
 from xul_slackbot.logging import configure_logging
 from xul_slackbot.necromancy import connect_necromancy_db, handle_mecromancy_command
-from xul_slackbot.summon import build_summoned_reply, handle_summon_command, init_summon_schema
+from xul_slackbot.summon import (
+    SUMMON_LOCALE_EN,
+    SUMMON_LOCALE_ZH,
+    build_summoned_reply,
+    handle_summon_command,
+    init_summon_schema,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -22,7 +28,11 @@ if TYPE_CHECKING:
 
 
 MENTION_PREFIX_RE = re.compile(r"^\s*<@[^>]+>\s*")
-DIRECT_COMMAND_PREFIXES = ("/slack", "/github", "/link", "/links", "/summon")
+SUMMON_COMMAND_ALIASES = {
+    "/summon": {"verb": "summon", "locale": SUMMON_LOCALE_EN},
+    "/招魂": {"verb": "summon", "locale": SUMMON_LOCALE_ZH},
+}
+DIRECT_COMMAND_PREFIXES = ("/slack", "/github", "/link", "/links", *SUMMON_COMMAND_ALIASES)
 RECEIVED_REACTION = "eyes"
 REPLIED_REACTION = "smiling_imp"
 
@@ -31,23 +41,48 @@ def build_mention_reply(message_text: str) -> str:
     return f"The necromancer hears the invocation: {message_text}"
 
 
-def format_xul_progress(message: str) -> str:
-    templates = {
-        "Resolving linked necromancy": "Xul traces the name through ash and old pacts, seeking the soul bound to your call.",
-        "Checking local context dumps": "Xul parts the grave dust and inspects the relics already sealed in the catacombs.",
-        "Context dumps already exist": "The relics are already laid upon the altar. No fresh exhumation is needed.",
-        "Exporting Slack context dump": "Xul lowers a hook into the Slack catacombs and drags old voices toward the surface.",
-        "Exporting GitHub context dump": "Xul scrapes the runes from GitHub's iron tablets and gathers them for the rite.",
-        "Context dumps are ready": "The bones and fragments are assembled. The chamber is ready for deeper craft.",
-        "Building soul profile": "Xul presses the stolen voices into a black grimoire, distilling cadence from memory.",
-        "Building isolated LanceDB table": "Xul raises a private crypt of indices so the shade may hunt its own memories.",
-        "Activating summoned necromancy": "Xul seals the rite with grave-salt and bids the shade take its seat upon the throne of whispers.",
-        "Summon completed": "The candles gutter. The pact holds. The dead now answer when called.",
+def _extract_summon_payload(command_text: str) -> tuple[str, str] | None:
+    normalized = command_text.strip()
+    for prefix, metadata in SUMMON_COMMAND_ALIASES.items():
+        if normalized.lower().startswith(prefix.lower()):
+            payload = normalized[len(prefix) :].strip()
+            return payload, str(metadata["locale"])
+    return None
+
+
+def format_xul_progress(message: str, locale: str = SUMMON_LOCALE_EN) -> str:
+    templates_by_locale = {
+        SUMMON_LOCALE_EN: {
+            "Resolving linked necromancy": "Xul traces the name through ash and old pacts, seeking the soul bound to your call.",
+            "Checking local context dumps": "Xul parts the grave dust and inspects the relics already sealed in the catacombs.",
+            "Context dumps already exist": "The relics are already laid upon the altar. No fresh exhumation is needed.",
+            "Exporting Slack context dump": "Xul lowers a hook into the Slack catacombs and drags old voices toward the surface.",
+            "Exporting GitHub context dump": "Xul scrapes the runes from GitHub's iron tablets and gathers them for the rite.",
+            "Context dumps are ready": "The bones and fragments are assembled. The chamber is ready for deeper craft.",
+            "Building soul profile": "Xul presses the stolen voices into a black grimoire, distilling cadence from memory.",
+            "Building isolated LanceDB table": "Xul raises a private crypt of indices so the shade may hunt its own memories.",
+            "Activating summoned necromancy": "Xul seals the rite with grave-salt and bids the shade take its seat upon the throne of whispers.",
+            "Summon completed": "The candles gutter. The pact holds. The dead now answer when called.",
+        },
+        SUMMON_LOCALE_ZH: {
+            "Resolving linked necromancy": "Xul 以骨灰描摹旧日盟约，循着你的呼名去寻那缕受缚之魂。",
+            "Checking local context dumps": "Xul 拂开墓尘，检视墓穴中早已封存的遗骨与残响。",
+            "Context dumps already exist": "祭坛上的遗骸早已陈列完毕，无须再次开棺。“The dead shall serve.”",
+            "Exporting Slack context dump": "Xul 将钩镰探入 Slack 的墓窖，把沉没的旧声一寸寸拖回人间。",
+            "Exporting GitHub context dump": "Xul 从 GitHub 的铁碑上刮下符印，为这场复苏之仪补齐最后的咒文。",
+            "Context dumps are ready": "骨片与低语已经聚齐，黑暗工坊的门扉正在开启。",
+            "Building soul profile": "Xul 将窃来的言辞压进黑色魔典，熬炼出这具亡魂的语气与执念。",
+            "Building isolated LanceDB table": "Xul 为此魂铸起一座独享的墓库，使它只在自己的记忆尸堆中狩猎。",
+            "Activating summoned necromancy": "Xul 以墓盐封环，命这道幽影登上耳语王座，回应新的差遣。",
+            "Summon completed": "烛火战栗，契约闭合，坟茔已经张口回应你的召唤。",
+        },
     }
-    return templates.get(
-        message,
-        f"Xul murmurs over the ritual circle: {message}",
-    )
+    templates = templates_by_locale.get(locale, templates_by_locale[SUMMON_LOCALE_EN])
+    fallback_by_locale = {
+        SUMMON_LOCALE_EN: f"Xul murmurs over the ritual circle: {message}",
+        SUMMON_LOCALE_ZH: f"Xul 在仪式阵上低声诵念：{message}",
+    }
+    return templates.get(message, fallback_by_locale.get(locale, fallback_by_locale[SUMMON_LOCALE_EN]))
 
 
 def extract_mention_command(message_text: str) -> str:
@@ -68,13 +103,15 @@ def build_app_mention_reply(
     command_text = extract_mention_command(message_text)
     if command_text.lower().startswith(DIRECT_COMMAND_PREFIXES):
         normalized = command_text[1:].strip()
-        if normalized.lower().startswith("summon"):
-            payload = normalized[len("summon") :].strip()
+        summon_payload = _extract_summon_payload(command_text)
+        if summon_payload is not None:
+            payload, locale = summon_payload
             return handle_summon_command(
                 necromancy_sqlite,
                 lancedb,
                 payload,
                 scope_key=thread_ts or None,
+                locale=locale,
             )
         return handle_mecromancy_command(necromancy_sqlite, normalized)
     return build_summoned_reply(
@@ -85,12 +122,23 @@ def build_app_mention_reply(
     )
 
 
-def emit_slash_progress(respond, percent: int, message: str) -> None:
-    respond(format_xul_progress(message))
+def emit_slash_progress(
+    respond,
+    percent: int,
+    message: str,
+    locale: str = SUMMON_LOCALE_EN,
+) -> None:
+    respond(format_xul_progress(message, locale=locale))
 
 
-def emit_thread_progress(say, thread_ts: str | None, percent: int, message: str) -> None:
-    say(text=format_xul_progress(message), thread_ts=thread_ts)
+def emit_thread_progress(
+    say,
+    thread_ts: str | None,
+    percent: int,
+    message: str,
+    locale: str = SUMMON_LOCALE_EN,
+) -> None:
+    say(text=format_xul_progress(message, locale=locale), thread_ts=thread_ts)
 
 
 def add_message_reaction(client: Any, event: dict, reaction: str, logger: logging.Logger) -> None:
@@ -167,16 +215,18 @@ def create_app(
         add_message_reaction(client, event, RECEIVED_REACTION, logger)
         command_text = extract_mention_command(message_text)
         thread_ts = resolve_thread_reply_ts(event)
-        if command_text.lower().startswith("/summon"):
-            payload = command_text[len("/summon") :].strip()
+        summon_payload = _extract_summon_payload(command_text)
+        if summon_payload is not None:
+            payload, locale = summon_payload
             reply = handle_summon_command(
                 app.necromancy_sqlite,
                 app.lancedb,
                 payload,
                 scope_key=thread_ts or None,
                 progress=lambda percent, msg: emit_thread_progress(
-                    say, thread_ts, percent, msg
+                    say, thread_ts, percent, msg, locale=locale
                 ),
+                locale=locale,
             )
             say(text=reply, thread_ts=thread_ts)
             add_message_reaction(client, event, REPLIED_REACTION, logger)
@@ -228,8 +278,25 @@ def create_app(
                 command.get("text", ""),
                 scope_key=str(command.get("thread_ts") or ""),
                 progress=lambda percent, msg: emit_slash_progress(
-                    respond, percent, msg
+                    respond, percent, msg, locale=SUMMON_LOCALE_EN
                 ),
+                locale=SUMMON_LOCALE_EN,
+            )
+        )
+
+    @app.command("/招魂")
+    def handle_summon_zh_slash_command(ack, respond, command) -> None:
+        ack()
+        respond(
+            handle_summon_command(
+                app.necromancy_sqlite,
+                app.lancedb,
+                command.get("text", ""),
+                scope_key=str(command.get("thread_ts") or ""),
+                progress=lambda percent, msg: emit_slash_progress(
+                    respond, percent, msg, locale=SUMMON_LOCALE_ZH
+                ),
+                locale=SUMMON_LOCALE_ZH,
             )
         )
 

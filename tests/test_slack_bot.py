@@ -15,6 +15,7 @@ from xul_slackbot.bot import (
     DEFAULT_NECROMANCY_SQLITE,
     RECEIVED_REACTION,
     REPLIED_REACTION,
+    SUMMON_COMMAND_ALIASES,
     add_message_reaction,
     build_app_mention_reply,
     build_arg_parser,
@@ -31,7 +32,9 @@ from xul_slackbot.lancedb import connect_lancedb
 from xul_slackbot.logging import configure_logging
 from xul_slackbot.necromancy import connect_necromancy_db, handle_mecromancy_command
 from xul_slackbot.summon import (
+    SUMMON_LOCALE_ZH,
     _call_openai_chat_completion,
+    build_xul_prompts,
     build_summon_prompts,
     build_summoned_reply,
     collect_soul_quotes,
@@ -76,7 +79,11 @@ class SlackBotTestCase(unittest.TestCase):
         self.assertTrue(should_handle_mecromancy_mention("<@U123> /link xiangyu tabversion"))
         self.assertTrue(should_handle_mecromancy_mention("<@U123> /links"))
         self.assertTrue(should_handle_mecromancy_mention("<@U123> /summon xiangyu"))
+        self.assertTrue(should_handle_mecromancy_mention("<@U123> /招魂 xiangyu"))
         self.assertFalse(should_handle_mecromancy_mention("<@U123> hello"))
+
+    def test_summon_aliases_include_chinese_command(self) -> None:
+        self.assertIn("/招魂", SUMMON_COMMAND_ALIASES)
 
     def test_resolve_thread_reply_ts_prefers_existing_thread(self) -> None:
         self.assertEqual(
@@ -281,9 +288,26 @@ class SlackBotTestCase(unittest.TestCase):
         mocked.assert_called_once()
         self.assertEqual(mocked.call_args.kwargs["scope_key"], "123.456")
 
+    def test_build_app_mention_reply_routes_chinese_summon_command(self) -> None:
+        with patch(
+            "xul_slackbot.bot.handle_summon_command",
+            return_value="summoned in zh",
+        ) as mocked:
+            response = build_app_mention_reply(
+                DEFAULT_NECROMANCY_SQLITE,
+                object(),
+                "<@U123> /招魂 xiangyu",
+                thread_ts="123.456",
+            )
+        self.assertEqual(response, "summoned in zh")
+        mocked.assert_called_once()
+        self.assertEqual(mocked.call_args.kwargs["scope_key"], "123.456")
+        self.assertEqual(mocked.call_args.kwargs["locale"], SUMMON_LOCALE_ZH)
+
     def test_emit_progress_helpers(self) -> None:
         slash_messages: list[str] = []
         thread_messages: list[tuple[str, str | None]] = []
+        zh_messages: list[str] = []
 
         emit_slash_progress(slash_messages.append, 30, "Checking local context dumps")
         emit_thread_progress(
@@ -291,6 +315,12 @@ class SlackBotTestCase(unittest.TestCase):
             "123.456",
             70,
             "Building isolated LanceDB table",
+        )
+        emit_slash_progress(
+            zh_messages.append,
+            40,
+            "Context dumps already exist",
+            locale=SUMMON_LOCALE_ZH,
         )
 
         self.assertEqual(
@@ -308,11 +338,19 @@ class SlackBotTestCase(unittest.TestCase):
                 )
             ],
         )
+        self.assertEqual(
+            zh_messages,
+            ['祭坛上的遗骸早已陈列完毕，无须再次开棺。“The dead shall serve.”'],
+        )
 
     def test_format_xul_progress_uses_fallback_for_unknown_message(self) -> None:
         self.assertEqual(
             format_xul_progress("Unmapped step"),
             "Xul murmurs over the ritual circle: Unmapped step",
+        )
+        self.assertEqual(
+            format_xul_progress("Unmapped step", locale=SUMMON_LOCALE_ZH),
+            "Xul 在仪式阵上低声诵念：Unmapped step",
         )
 
     def test_add_message_reaction_uses_slack_client(self) -> None:
@@ -423,6 +461,67 @@ class SlackBotTestCase(unittest.TestCase):
             self.assertEqual(active["github_login"], "tabversion")
             self.assertIn("soul_xiangyu__tabversion.md", active["soul_path"])
 
+    def test_handle_summon_command_localizes_chinese_response(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "necromancy.sqlite"
+            conn = connect_necromancy_db(db_path)
+            init_summon_schema(conn)
+            conn.execute(
+                """
+                INSERT INTO slack_users(user_id, username, display_name, real_name, email)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                ("U1", "xiangyu", "Xiangyu", "Xiangyu Hu", "xiangyu@example.com"),
+            )
+            conn.execute(
+                """
+                INSERT INTO github_users(
+                    login,
+                    issue_or_pr_authored,
+                    issue_comments_authored,
+                    pr_reviews_authored,
+                    pr_review_comments_authored,
+                    mentions
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                ("tabversion", 1, 2, 3, 4, 5),
+            )
+            conn.execute(
+                """
+                INSERT INTO necromancy_links(slack_user_id, github_login, created_at, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """,
+                ("U1", "tabversion"),
+            )
+            conn.commit()
+            conn.close()
+
+            fake_lancedb = object()
+            slack_dump = Path(tmpdir) / "data" / "user_context_exports" / "slack" / "slack_user_xiangyu.sqlite"
+            github_dump = Path(tmpdir) / "data" / "user_context_exports" / "github" / "github_user_tabversion.sqlite"
+
+            with patch(
+                "xul_slackbot.summon.ensure_context_dumps",
+                return_value=(slack_dump, github_dump),
+            ), patch(
+                "xul_slackbot.summon.ensure_soul_profile",
+                return_value=Path(tmpdir) / "data" / "souls" / "soul_xiangyu__tabversion.md",
+            ), patch(
+                "xul_slackbot.summon.ensure_summon_lancedb_table",
+                return_value=("summon_xiangyu_tabversion", 7),
+            ):
+                response = handle_summon_command(
+                    db_path,
+                    fake_lancedb,
+                    "xiangyu",
+                    scope_key="thread-1",
+                    data_dir=Path(tmpdir) / "data",
+                    locale=SUMMON_LOCALE_ZH,
+                )
+
+            self.assertIn("仪式已成", response)
+            self.assertIn("The grave beckons.", response)
+
     def test_build_summoned_reply_requires_openai_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "necromancy.sqlite"
@@ -491,10 +590,54 @@ class SlackBotTestCase(unittest.TestCase):
         self.assertIn("Do not tack on a follow-up question", system_prompt)
         self.assertIn("Only ask a question when", system_prompt)
         self.assertIn("Prioritize matching the person's style", system_prompt)
+        self.assertIn("Do not default to being especially polite", system_prompt)
+        self.assertIn("Keep behavioral constraints minimal", system_prompt)
         self.assertIn("Message to respond to:", user_prompt)
         self.assertIn("Soul profile:", user_prompt)
         self.assertIn("## Voice Summary", user_prompt)
         self.assertIn("Local context about you:", user_prompt)
+
+    def test_build_xul_prompts_include_style_and_summon_usage(self) -> None:
+        system_prompt, user_prompt = build_xul_prompts("how do i use xul to summon someone?")
+
+        self.assertIn("You are Xul", system_prompt)
+        self.assertIn("Do not default to being especially polite", system_prompt)
+        self.assertIn("Do not force a follow-up question", system_prompt)
+        self.assertIn("Keep behavioral constraints minimal", system_prompt)
+        self.assertIn("/summon <linked_necromancy>", user_prompt)
+        self.assertIn("/招魂 <linked_necromancy>", user_prompt)
+        self.assertIn("plain mentions speak as Xul", user_prompt)
+        self.assertIn("If the user asks how to summon", user_prompt)
+
+    def test_build_summoned_reply_falls_back_to_xul_when_no_active_summon(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "necromancy.sqlite"
+            conn = connect_necromancy_db(db_path)
+            init_summon_schema(conn)
+            conn.close()
+
+            with patch(
+                "xul_slackbot.summon._call_openai_chat_completion",
+                return_value="The grave beckons. Use /summon or /招魂 in this thread.",
+            ) as mocked_call, patch(
+                "xul_slackbot.summon.get_required_config_value",
+                return_value="test-key",
+            ), patch(
+                "xul_slackbot.summon.get_config_value",
+                side_effect=lambda key, default="": default,
+            ):
+                response = build_summoned_reply(
+                    db_path,
+                    object(),
+                    "how do i summon?",
+                    scope_key="thread-1",
+                )
+
+            self.assertEqual(
+                response,
+                "Xul: The grave beckons. Use /summon or /招魂 in this thread.",
+            )
+            mocked_call.assert_called_once()
 
     def test_render_soul_markdown_includes_quotes(self) -> None:
         quotes = [

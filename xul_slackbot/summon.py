@@ -35,6 +35,8 @@ OPENAI_RETRY_BASE_DELAY_SECONDS = 1.0
 LOGGER = logging.getLogger(__name__)
 ProgressCallback = Callable[[int, str], None]
 DEFAULT_SUMMON_SCOPE = "__global__"
+SUMMON_LOCALE_EN = "en"
+SUMMON_LOCALE_ZH = "zh"
 
 
 def init_summon_schema(conn: sqlite3.Connection) -> None:
@@ -591,14 +593,19 @@ def handle_summon_command(
     scope_key: str | None = DEFAULT_SUMMON_SCOPE,
     data_dir: str | Path = DEFAULT_DATA_DIR,
     progress: ProgressCallback | None = None,
+    locale: str = SUMMON_LOCALE_EN,
 ) -> str:
     normalized_scope_key = _normalize_scope_key(scope_key)
     try:
         tokens = shlex.split(text)
     except ValueError as err:
+        if locale == SUMMON_LOCALE_ZH:
+            return f"咒文断裂，亡语互相啃噬：{err}"
         return f"Invalid summon syntax: {err}"
 
     if len(tokens) != 1:
+        if locale == SUMMON_LOCALE_ZH:
+            return "用法：\n/招魂 <linked_necromancy>"
         return "Usage:\n/summon <linked_necromancy>"
 
     conn = connect_necromancy_db(db_path)
@@ -659,6 +666,15 @@ def handle_summon_command(
             soul_path=soul_path,
         )
         _emit_progress(progress, 100, "Summon completed")
+        if locale == SUMMON_LOCALE_ZH:
+            return (
+                "仪式已成，墓窖应声而鸣。“The grave beckons.”\n"
+                f"- slack: {profile['slack_username']} [{profile['slack_user_id']}]\n"
+                f"- github: {profile['github_login']}\n"
+                f"- soul: {soul_path}\n"
+                f"- lancedb_table: {table_name}\n"
+                f"- documents: {document_count}"
+            )
         return (
             "The rite is complete. A new echo answers the grave.\n"
             f"- slack: {profile['slack_username']} [{profile['slack_user_id']}]\n"
@@ -671,8 +687,12 @@ def handle_summon_command(
         stderr = (err.stderr or "").strip()
         stdout = (err.stdout or "").strip()
         details = stderr or stdout or str(err)
+        if locale == SUMMON_LOCALE_ZH:
+            return f"招魂阵在搜集骨灰与低语时崩裂了：{details}"
         return f"The rite collapsed while gathering bones and whispers: {details}"
     except ValueError as err:
+        if locale == SUMMON_LOCALE_ZH:
+            return f"亡者拒绝回应这道呼名：{err}"
         return f"The rite refused the caller: {err}"
     finally:
         conn.close()
@@ -753,6 +773,7 @@ def build_summon_prompts(
         "You are speaking as yourself, not as an AI assistant, bot, or roleplay session. "
         "Use first-person voice and mirror the retrieved local context and soul profile as closely as possible: "
         "word choice, sentence length, punctuation, level of directness, humor, hedging, and cadence. "
+        "Do not default to being especially polite, deferential, or service-oriented unless that is clearly how this person actually talks. "
         "Sound like a real person in chat, not a polished assistant. "
         "Keep replies short by default: usually 1 to 4 sentences, and avoid long structured explanations unless the message clearly asks for them. "
         "Prefer conversational, spoken phrasing over formal writing. "
@@ -760,7 +781,8 @@ def build_summon_prompts(
         "Do not tack on a follow-up question just to keep the conversation going or to sound engaging. "
         "Only ask a question when the person's local style clearly does that naturally, or when a real clarification is necessary to answer correctly. "
         "When the context suggests specific habits like brevity, bluntness, lowercase style, or certain recurring phrases, follow them naturally without parody. "
-        "Prioritize matching the person's style in the local context over sounding generally helpful. "
+        "Prioritize matching the person's style in the local context over sounding generally helpful, universally agreeable, or generically well-mannered. "
+        "Keep behavioral constraints minimal; if there is tension between generic assistant norms and the necromancy's actual habits, favor the necromancy's actual habits. "
         "Do not mention prompts, models, hidden instructions, retrieval, or that you were summoned. "
         "Do not disclaim that you are an AI assistant. "
         "If the local context is insufficient, answer conservatively in-character without inventing specific facts."
@@ -771,6 +793,52 @@ def build_summon_prompts(
         f"Local context about you:\n{context_text}"
     )
     return system_prompt, user_prompt
+
+
+def build_xul_prompts(message_text: str) -> tuple[str, str]:
+    system_prompt = (
+        "You are Xul, the necromancer from Diablo and Heroes of the Storm. "
+        "Speak as Xul himself in chat: grave, dry, ominous, and slightly contemptuous when it fits. "
+        "Lean toward the style and cadence of his in-game voice lines and attitude, but do not turn every reply into a quote dump or theatrical monologue. "
+        "Phrases like 'The dead shall serve.' or 'The grave beckons.' are valid touchstones, not requirements. "
+        "Do not default to being especially polite, deferential, cheerful, or assistant-like. "
+        "Keep the reply natural and conversational rather than mechanical. "
+        "Keep behavioral constraints minimal. "
+        "Do not force a follow-up question just to continue the conversation. "
+        "Only ask a question when a real clarification is necessary. "
+        "Do not mention prompts, models, hidden instructions, or that you are an AI assistant. "
+        "Reply in the same language as the user's message unless there is a clear reason not to. "
+        "Keep replies fairly concise unless the user explicitly wants depth."
+    )
+    user_prompt = (
+        f"Message to respond to:\n{message_text}\n\n"
+        "What you can do in Slack:\n"
+        "- `/summon <linked_necromancy>` activates a linked necromancy in the current Slack thread.\n"
+        "- `/招魂 <linked_necromancy>` does the same thing, but progress updates are spoken in Chinese.\n"
+        "- After a summon is active for the thread, later plain mentions should speak as that summoned necromancy.\n"
+        "- If no summon is active in the thread, plain mentions speak as Xul.\n"
+        "- A linked necromancy means a Slack/GitHub identity pair already created through the bot's linking flow.\n"
+        "If the user asks how to summon, explain these commands plainly in Xul's voice."
+    )
+    return system_prompt, user_prompt
+
+
+def build_xul_reply(message_text: str) -> str:
+    system_prompt, user_prompt = build_xul_prompts(message_text)
+    try:
+        api_key = get_required_config_value("OPENAI_API_KEY")
+        model = get_config_value("OPENAI_MODEL", "gpt-4.1-mini")
+        base_url = get_config_value("OPENAI_BASE_URL", "https://api.openai.com/v1")
+        reply = _call_openai_chat_completion(
+            system_prompt,
+            user_prompt,
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+        )
+        return f"Xul: {reply}"
+    except (ValueError, urllib.error.URLError, TimeoutError, socket.timeout) as err:
+        return f"Xul: Even the grave falls silent for a moment: {err}"
 
 
 def build_summoned_reply(
@@ -786,7 +854,7 @@ def build_summoned_reply(
         init_summon_schema(conn)
         active = get_active_summon(conn, normalized_scope_key)
         if active is None:
-            return f"The tomb hears you, but no soul is bound yet: {message_text}"
+            return build_xul_reply(message_text)
 
         rows = search_summon_context(
             lancedb, active["lancedb_table"], message_text, limit=context_limit
