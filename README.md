@@ -1,6 +1,6 @@
 # Xul
 
-一个用于整理 Slack / GitHub 上下文并提供 Slack Bot 能力的工具集。
+The necromancer who can “revive” resigned employees.
 
 ![Xul](assets/xul.png)
 

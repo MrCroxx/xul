@@ -35,6 +35,7 @@ SUMMON_COMMAND_ALIASES = {
 DIRECT_COMMAND_PREFIXES = ("/slack", "/github", "/link", "/links", *SUMMON_COMMAND_ALIASES)
 RECEIVED_REACTION = "eyes"
 REPLIED_REACTION = "smiling_imp"
+DEFAULT_THREAD_CONTEXT_MESSAGE_LIMIT = 20
 
 
 def build_mention_reply(message_text: str) -> str:
@@ -99,6 +100,7 @@ def build_app_mention_reply(
     lancedb: Any,
     message_text: str,
     thread_ts: str | None = None,
+    thread_context: str = "",
 ) -> str:
     command_text = extract_mention_command(message_text)
     if command_text.lower().startswith(DIRECT_COMMAND_PREFIXES):
@@ -119,6 +121,7 @@ def build_app_mention_reply(
         lancedb,
         command_text,
         scope_key=thread_ts or None,
+        thread_context=thread_context,
     )
 
 
@@ -170,6 +173,84 @@ def should_ignore_message_event(event: dict) -> bool:
         return True
 
     return "bot_id" in event
+
+
+def _parse_slack_ts(value: object) -> float:
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return float("inf")
+    return float("inf")
+
+
+def format_thread_context(
+    messages: Sequence[dict[str, object]],
+    current_ts: str | None = None,
+    limit: int = DEFAULT_THREAD_CONTEXT_MESSAGE_LIMIT,
+) -> str:
+    current_ts_value = _parse_slack_ts(current_ts)
+    visible_messages: list[dict[str, object]] = []
+    for message in sorted(messages, key=lambda item: _parse_slack_ts(item.get("ts"))):
+        message_ts = message.get("ts")
+        if current_ts is not None and message_ts == current_ts:
+            continue
+        if current_ts is not None and _parse_slack_ts(message_ts) > current_ts_value:
+            continue
+        text = str(message.get("text") or "").strip()
+        if not text:
+            continue
+        visible_messages.append(message)
+
+    if limit > 0:
+        visible_messages = visible_messages[-limit:]
+    if not visible_messages:
+        return "No prior thread context."
+
+    lines: list[str] = []
+    for message in visible_messages:
+        author = (
+            str(message.get("user") or "")
+            or str(message.get("username") or "")
+            or str(message.get("bot_id") or "")
+            or "unknown"
+        )
+        text = str(message.get("text") or "").strip()
+        lines.append(f"[{message.get('ts', '?')}] {author}: {text}")
+    return "\n".join(lines)
+
+
+def fetch_thread_context(
+    client: Any,
+    event: dict,
+    thread_ts: str | None,
+    limit: int = DEFAULT_THREAD_CONTEXT_MESSAGE_LIMIT,
+) -> str:
+    channel = event.get("channel")
+    if not isinstance(channel, str) or not channel:
+        return ""
+    if not isinstance(thread_ts, str) or not thread_ts:
+        return ""
+    try:
+        response = client.conversations_replies(channel=channel, ts=thread_ts)
+    except Exception as err:
+        LOGGER.warning(
+            "Failed to fetch Slack thread context for %s/%s: %s",
+            channel,
+            thread_ts,
+            err,
+        )
+        return ""
+
+    messages = response.get("messages", [])
+    if not isinstance(messages, list):
+        return ""
+    current_ts = event.get("ts")
+    return format_thread_context(
+        [item for item in messages if isinstance(item, dict)],
+        current_ts=current_ts if isinstance(current_ts, str) else None,
+        limit=limit,
+    )
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -231,12 +312,14 @@ def create_app(
             say(text=reply, thread_ts=thread_ts)
             add_message_reaction(client, event, REPLIED_REACTION, logger)
             return
+        thread_context = fetch_thread_context(client, event, thread_ts)
         say(
             text=build_app_mention_reply(
                 app.necromancy_sqlite,
                 app.lancedb,
                 message_text,
                 thread_ts=thread_ts,
+                thread_context=thread_context,
             ),
             thread_ts=thread_ts,
         )

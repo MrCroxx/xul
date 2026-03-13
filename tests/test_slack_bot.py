@@ -13,6 +13,7 @@ from xul_slackbot.config import get_config_value, get_required_config_value
 from xul_slackbot.bot import (
     DEFAULT_LANCEDB_DIR,
     DEFAULT_NECROMANCY_SQLITE,
+    DEFAULT_THREAD_CONTEXT_MESSAGE_LIMIT,
     RECEIVED_REACTION,
     REPLIED_REACTION,
     SUMMON_COMMAND_ALIASES,
@@ -23,7 +24,9 @@ from xul_slackbot.bot import (
     emit_slash_progress,
     emit_thread_progress,
     extract_mention_command,
+    fetch_thread_context,
     format_xul_progress,
+    format_thread_context,
     resolve_thread_reply_ts,
     should_handle_mecromancy_mention,
     should_ignore_message_event,
@@ -100,6 +103,42 @@ class SlackBotTestCase(unittest.TestCase):
 
     def test_should_not_ignore_user_message(self) -> None:
         self.assertFalse(should_ignore_message_event({"text": "hello"}))
+
+    def test_format_thread_context_excludes_current_message_and_keeps_recent_history(self) -> None:
+        messages = [
+            {"ts": "100.0", "user": "U1", "text": "root"},
+            {"ts": "101.0", "user": "U2", "text": "first reply"},
+            {"ts": "102.0", "user": "U3", "text": "current reply"},
+            {"ts": "103.0", "user": "U4", "text": "future reply"},
+        ]
+
+        context = format_thread_context(messages, current_ts="102.0", limit=DEFAULT_THREAD_CONTEXT_MESSAGE_LIMIT)
+
+        self.assertIn("[100.0] U1: root", context)
+        self.assertIn("[101.0] U2: first reply", context)
+        self.assertNotIn("current reply", context)
+        self.assertNotIn("future reply", context)
+
+    def test_fetch_thread_context_reads_slack_thread_history(self) -> None:
+        client = SimpleNamespace(
+            conversations_replies=lambda channel, ts: {
+                "messages": [
+                    {"ts": "100.0", "user": "U1", "text": "root"},
+                    {"ts": "101.0", "user": "U2", "text": "older reply"},
+                    {"ts": "102.0", "user": "U3", "text": "current reply"},
+                ]
+            }
+        )
+
+        context = fetch_thread_context(
+            client,
+            {"channel": "C1", "ts": "102.0"},
+            "100.0",
+        )
+
+        self.assertIn("root", context)
+        self.assertIn("older reply", context)
+        self.assertNotIn("current reply", context)
 
     def test_connect_lancedb_creates_missing_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -264,14 +303,16 @@ class SlackBotTestCase(unittest.TestCase):
             self.assertIn("GitHub mecromancy results for `tab`:", response)
 
     def test_build_app_mention_reply_keeps_non_command_echo(self) -> None:
-        with patch("xul_slackbot.bot.build_summoned_reply", return_value="persona reply"):
+        with patch("xul_slackbot.bot.build_summoned_reply", return_value="persona reply") as mocked:
             response = build_app_mention_reply(
                 DEFAULT_NECROMANCY_SQLITE,
                 object(),
                 "<@U123> hello there",
                 thread_ts="123.456",
+                thread_context="[100.0] U1: prior message",
             )
         self.assertEqual(response, "persona reply")
+        self.assertEqual(mocked.call_args.kwargs["thread_context"], "[100.0] U1: prior message")
 
     def test_build_app_mention_reply_routes_summon_command(self) -> None:
         with patch(
@@ -580,6 +621,7 @@ class SlackBotTestCase(unittest.TestCase):
             "How would you approach this?",
             "Local context here",
             "## Voice Summary\n- terse",
+            "[100.0] U1: earlier thread message",
         )
 
         self.assertIn("You are xiangyu.", system_prompt)
@@ -593,17 +635,24 @@ class SlackBotTestCase(unittest.TestCase):
         self.assertIn("Do not default to being especially polite", system_prompt)
         self.assertIn("Keep behavioral constraints minimal", system_prompt)
         self.assertIn("Message to respond to:", user_prompt)
+        self.assertIn("Slack thread context:", user_prompt)
+        self.assertIn("earlier thread message", user_prompt)
         self.assertIn("Soul profile:", user_prompt)
         self.assertIn("## Voice Summary", user_prompt)
         self.assertIn("Local context about you:", user_prompt)
 
     def test_build_xul_prompts_include_style_and_summon_usage(self) -> None:
-        system_prompt, user_prompt = build_xul_prompts("how do i use xul to summon someone?")
+        system_prompt, user_prompt = build_xul_prompts(
+            "how do i use xul to summon someone?",
+            "[100.0] U1: can you help me",
+        )
 
         self.assertIn("You are Xul", system_prompt)
         self.assertIn("Do not default to being especially polite", system_prompt)
         self.assertIn("Do not force a follow-up question", system_prompt)
         self.assertIn("Keep behavioral constraints minimal", system_prompt)
+        self.assertIn("Slack thread context:", user_prompt)
+        self.assertIn("can you help me", user_prompt)
         self.assertIn("/summon <linked_necromancy>", user_prompt)
         self.assertIn("/招魂 <linked_necromancy>", user_prompt)
         self.assertIn("plain mentions speak as Xul", user_prompt)

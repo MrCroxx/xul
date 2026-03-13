@@ -767,6 +767,7 @@ def build_summon_prompts(
     message_text: str,
     context_text: str,
     soul_text: str = "",
+    thread_context: str = "",
 ) -> tuple[str, str]:
     system_prompt = (
         f"You are {slack_username}. Your GitHub login is {github_login}. "
@@ -788,6 +789,7 @@ def build_summon_prompts(
         "If the local context is insufficient, answer conservatively in-character without inventing specific facts."
     )
     user_prompt = (
+        f"Slack thread context:\n{thread_context or 'No prior thread context.'}\n\n"
         f"Message to respond to:\n{message_text}\n\n"
         f"Soul profile:\n{soul_text or 'No soul profile available.'}\n\n"
         f"Local context about you:\n{context_text}"
@@ -795,7 +797,7 @@ def build_summon_prompts(
     return system_prompt, user_prompt
 
 
-def build_xul_prompts(message_text: str) -> tuple[str, str]:
+def build_xul_prompts(message_text: str, thread_context: str = "") -> tuple[str, str]:
     system_prompt = (
         "You are Xul, the necromancer from Diablo and Heroes of the Storm. "
         "Speak as Xul himself in chat: grave, dry, ominous, and slightly contemptuous when it fits. "
@@ -811,6 +813,7 @@ def build_xul_prompts(message_text: str) -> tuple[str, str]:
         "Keep replies fairly concise unless the user explicitly wants depth."
     )
     user_prompt = (
+        f"Slack thread context:\n{thread_context or 'No prior thread context.'}\n\n"
         f"Message to respond to:\n{message_text}\n\n"
         "What you can do in Slack:\n"
         "- `/summon <linked_necromancy>` activates a linked necromancy in the current Slack thread.\n"
@@ -824,7 +827,11 @@ def build_xul_prompts(message_text: str) -> tuple[str, str]:
 
 
 def build_xul_reply(message_text: str) -> str:
-    system_prompt, user_prompt = build_xul_prompts(message_text)
+    return build_xul_reply_with_context(message_text, "")
+
+
+def build_xul_reply_with_context(message_text: str, thread_context: str = "") -> str:
+    system_prompt, user_prompt = build_xul_prompts(message_text, thread_context=thread_context)
     try:
         api_key = get_required_config_value("OPENAI_API_KEY")
         model = get_config_value("OPENAI_MODEL", "gpt-4.1-mini")
@@ -847,6 +854,7 @@ def build_summoned_reply(
     message_text: str,
     scope_key: str | None = DEFAULT_SUMMON_SCOPE,
     context_limit: int = DEFAULT_CONTEXT_LIMIT,
+    thread_context: str = "",
 ) -> str:
     normalized_scope_key = _normalize_scope_key(scope_key)
     conn = connect_necromancy_db(db_path)
@@ -854,7 +862,7 @@ def build_summoned_reply(
         init_summon_schema(conn)
         active = get_active_summon(conn, normalized_scope_key)
         if active is None:
-            return build_xul_reply(message_text)
+            return build_xul_reply_with_context(message_text, thread_context)
 
         rows = search_summon_context(
             lancedb, active["lancedb_table"], message_text, limit=context_limit
@@ -889,6 +897,7 @@ def build_summoned_reply(
         message_text,
         context_text,
         soul_text,
+        thread_context=thread_context,
     )
 
     try:
