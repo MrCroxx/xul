@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Sequence
 
 from xul_slackbot.lancedb import connect_lancedb
 from xul_slackbot.necromancy import connect_necromancy_db, handle_mecromancy_command
+from xul_slackbot.summon import build_summoned_reply, handle_summon_command, init_summon_schema
 
 
 LOGGER = logging.getLogger(__name__)
@@ -20,7 +21,9 @@ if TYPE_CHECKING:
 
 
 MENTION_PREFIX_RE = re.compile(r"^\s*<@[^>]+>\s*")
-DIRECT_COMMAND_PREFIXES = ("/slack", "/github", "/link", "/links")
+DIRECT_COMMAND_PREFIXES = ("/slack", "/github", "/link", "/links", "/summon")
+RECEIVED_REACTION = "eyes"
+REPLIED_REACTION = "smiling_imp"
 
 
 def build_mention_reply(message_text: str) -> str:
@@ -36,12 +39,38 @@ def should_handle_mecromancy_mention(message_text: str) -> bool:
     return normalized.startswith(DIRECT_COMMAND_PREFIXES)
 
 
-def build_app_mention_reply(necromancy_sqlite: str | Path, message_text: str) -> str:
+def build_app_mention_reply(
+    necromancy_sqlite: str | Path, lancedb: Any, message_text: str
+) -> str:
     command_text = extract_mention_command(message_text)
     if command_text.lower().startswith(DIRECT_COMMAND_PREFIXES):
-        command_text = command_text[1:].strip()
-        return handle_mecromancy_command(necromancy_sqlite, command_text)
-    return build_mention_reply(message_text)
+        normalized = command_text[1:].strip()
+        if normalized.lower().startswith("summon"):
+            payload = normalized[len("summon") :].strip()
+            return handle_summon_command(necromancy_sqlite, lancedb, payload)
+        return handle_mecromancy_command(necromancy_sqlite, normalized)
+    return build_summoned_reply(necromancy_sqlite, lancedb, command_text)
+
+
+def emit_slash_progress(respond, percent: int, message: str) -> None:
+    respond(f"[{percent}%] {message}")
+
+
+def emit_thread_progress(say, thread_ts: str | None, percent: int, message: str) -> None:
+    say(text=f"[{percent}%] {message}", thread_ts=thread_ts)
+
+
+def add_message_reaction(client: Any, event: dict, reaction: str, logger: logging.Logger) -> None:
+    channel = event.get("channel")
+    timestamp = event.get("ts")
+    if not isinstance(channel, str) or not channel:
+        return
+    if not isinstance(timestamp, str) or not timestamp:
+        return
+    try:
+        client.reactions_add(channel=channel, timestamp=timestamp, name=reaction)
+    except Exception as err:
+        logger.warning("Failed to add Slack reaction %s: %s", reaction, err)
 
 
 def resolve_thread_reply_ts(event: dict) -> str | None:
@@ -95,16 +124,34 @@ def create_app(
     app.lancedb = connect_lancedb(db_dir)
     app.lancedb_dir = str(db_dir)
     init_conn = connect_necromancy_db(necromancy_path)
+    init_summon_schema(init_conn)
     init_conn.close()
     app.necromancy_sqlite = str(necromancy_path)
 
     @app.event("app_mention")
-    def handle_app_mention(event: dict, say) -> None:
+    def handle_app_mention(event: dict, say, client, logger) -> None:
         message_text = event.get("text", "")
+        add_message_reaction(client, event, RECEIVED_REACTION, logger)
+        command_text = extract_mention_command(message_text)
+        if command_text.lower().startswith("/summon"):
+            payload = command_text[len("/summon") :].strip()
+            thread_ts = resolve_thread_reply_ts(event)
+            reply = handle_summon_command(
+                app.necromancy_sqlite,
+                app.lancedb,
+                payload,
+                progress=lambda percent, msg: emit_thread_progress(
+                    say, thread_ts, percent, msg
+                ),
+            )
+            say(text=reply, thread_ts=thread_ts)
+            add_message_reaction(client, event, REPLIED_REACTION, logger)
+            return
         say(
-            text=build_app_mention_reply(app.necromancy_sqlite, message_text),
+            text=build_app_mention_reply(app.necromancy_sqlite, app.lancedb, message_text),
             thread_ts=resolve_thread_reply_ts(event),
         )
+        add_message_reaction(client, event, REPLIED_REACTION, logger)
 
     def handle_direct_slash_command(subcommand: str, ack, respond, command) -> None:
         ack()
@@ -131,6 +178,20 @@ def create_app(
     @app.command("/links")
     def handle_links_slash_command(ack, respond, command) -> None:
         handle_direct_slash_command("links", ack, respond, command)
+
+    @app.command("/summon")
+    def handle_summon_slash_command(ack, respond, command) -> None:
+        ack()
+        respond(
+            handle_summon_command(
+                app.necromancy_sqlite,
+                app.lancedb,
+                command.get("text", ""),
+                progress=lambda percent, msg: emit_slash_progress(
+                    respond, percent, msg
+                ),
+            )
+        )
 
     @app.event("message")
     def handle_message_event(event: dict, logger) -> None:

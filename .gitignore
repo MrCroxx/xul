@@ -16,3 +16,6 @@ slack/node_modules/
 data/
 github_dump/
 slackdump*/
+
+# Env
+.env

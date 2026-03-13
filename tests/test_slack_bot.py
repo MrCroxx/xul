@@ -5,12 +5,18 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from xul_slackbot.config import get_config_value, get_required_config_value
 from xul_slackbot.bot import (
     DEFAULT_LANCEDB_DIR,
     DEFAULT_NECROMANCY_SQLITE,
+    RECEIVED_REACTION,
+    REPLIED_REACTION,
+    add_message_reaction,
     build_app_mention_reply,
     build_arg_parser,
     build_mention_reply,
+    emit_slash_progress,
+    emit_thread_progress,
     extract_mention_command,
     resolve_thread_reply_ts,
     should_handle_mecromancy_mention,
@@ -18,6 +24,13 @@ from xul_slackbot.bot import (
 )
 from xul_slackbot.lancedb import connect_lancedb
 from xul_slackbot.necromancy import connect_necromancy_db, handle_mecromancy_command
+from xul_slackbot.summon import (
+    build_summon_prompts,
+    build_summoned_reply,
+    get_active_summon,
+    handle_summon_command,
+    init_summon_schema,
+)
 
 
 class SlackBotTestCase(unittest.TestCase):
@@ -53,6 +66,7 @@ class SlackBotTestCase(unittest.TestCase):
         self.assertTrue(should_handle_mecromancy_mention("<@U123> /github tabversion"))
         self.assertTrue(should_handle_mecromancy_mention("<@U123> /link xiangyu tabversion"))
         self.assertTrue(should_handle_mecromancy_mention("<@U123> /links"))
+        self.assertTrue(should_handle_mecromancy_mention("<@U123> /summon xiangyu"))
         self.assertFalse(should_handle_mecromancy_mention("<@U123> hello"))
 
     def test_resolve_thread_reply_ts_prefers_existing_thread(self) -> None:
@@ -85,6 +99,38 @@ class SlackBotTestCase(unittest.TestCase):
             self.assertTrue(db_dir.exists())
             self.assertEqual(connect_calls, [str(db_dir.resolve())])
             self.assertEqual(result, {"uri": str(db_dir.resolve())})
+
+    def test_config_prefers_environment_then_dotenv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dotenv_path = Path(tmpdir) / ".env"
+            dotenv_path.write_text(
+                "OPENAI_API_KEY=dotenv-key\nOPENAI_BASE_URL=https://dotenv.example/v1\n",
+                encoding="utf-8",
+            )
+
+            with patch.dict(
+                "os.environ",
+                {"OPENAI_API_KEY": "env-key"},
+                clear=False,
+            ):
+                self.assertEqual(
+                    get_required_config_value("OPENAI_API_KEY", dotenv_path),
+                    "env-key",
+                )
+
+            with patch.dict("os.environ", {}, clear=False):
+                self.assertEqual(
+                    get_required_config_value("OPENAI_API_KEY", dotenv_path),
+                    "dotenv-key",
+                )
+                self.assertEqual(
+                    get_config_value(
+                        "OPENAI_BASE_URL",
+                        "https://api.openai.com/v1",
+                        dotenv_path,
+                    ),
+                    "https://dotenv.example/v1",
+                )
 
     def test_handle_mecromancy_command_queries_and_links_users(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -162,16 +208,214 @@ class SlackBotTestCase(unittest.TestCase):
             conn.commit()
             conn.close()
 
-            response = build_app_mention_reply(
-                db_path, "<@U123> /github tab"
-            )
+            response = build_app_mention_reply(db_path, object(), "<@U123> /github tab")
             self.assertIn("GitHub mecromancy results for `tab`:", response)
 
     def test_build_app_mention_reply_keeps_non_command_echo(self) -> None:
-        response = build_app_mention_reply(
-            DEFAULT_NECROMANCY_SQLITE, "<@U123> hello there"
+        with patch("xul_slackbot.bot.build_summoned_reply", return_value="persona reply"):
+            response = build_app_mention_reply(
+                DEFAULT_NECROMANCY_SQLITE, object(), "<@U123> hello there"
+            )
+        self.assertEqual(response, "persona reply")
+
+    def test_build_app_mention_reply_routes_summon_command(self) -> None:
+        with patch(
+            "xul_slackbot.bot.handle_summon_command",
+            return_value="summoned",
+        ) as mocked:
+            response = build_app_mention_reply(
+                DEFAULT_NECROMANCY_SQLITE,
+                object(),
+                "<@U123> /summon xiangyu",
+            )
+        self.assertEqual(response, "summoned")
+        mocked.assert_called_once()
+
+    def test_emit_progress_helpers(self) -> None:
+        slash_messages: list[str] = []
+        thread_messages: list[tuple[str, str | None]] = []
+
+        emit_slash_progress(slash_messages.append, 30, "Checking local context dumps")
+        emit_thread_progress(
+            lambda text, thread_ts=None: thread_messages.append((text, thread_ts)),
+            "123.456",
+            70,
+            "Building isolated LanceDB table",
         )
-        self.assertEqual(response, "Received: <@U123> hello there")
+
+        self.assertEqual(
+            slash_messages,
+            ["[30%] Checking local context dumps"],
+        )
+        self.assertEqual(
+            thread_messages,
+            [("[70%] Building isolated LanceDB table", "123.456")],
+        )
+
+    def test_add_message_reaction_uses_slack_client(self) -> None:
+        calls: list[dict[str, str]] = []
+
+        class FakeClient:
+            def reactions_add(self, *, channel: str, timestamp: str, name: str) -> None:
+                calls.append(
+                    {"channel": channel, "timestamp": timestamp, "name": name}
+                )
+
+        add_message_reaction(
+            FakeClient(),
+            {"channel": "C1", "ts": "100.0"},
+            RECEIVED_REACTION,
+            logger=SimpleNamespace(warning=lambda *args, **kwargs: None),
+        )
+        add_message_reaction(
+            FakeClient(),
+            {"channel": "C1", "ts": "100.0"},
+            REPLIED_REACTION,
+            logger=SimpleNamespace(warning=lambda *args, **kwargs: None),
+        )
+
+        self.assertEqual(
+            calls,
+            [
+                {"channel": "C1", "timestamp": "100.0", "name": "eyes"},
+                {"channel": "C1", "timestamp": "100.0", "name": "smiling_imp"},
+            ],
+        )
+
+    def test_handle_summon_command_activates_linked_necromancy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "necromancy.sqlite"
+            conn = connect_necromancy_db(db_path)
+            init_summon_schema(conn)
+            conn.execute(
+                """
+                INSERT INTO slack_users(user_id, username, display_name, real_name, email)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                ("U1", "xiangyu", "Xiangyu", "Xiangyu Hu", "xiangyu@example.com"),
+            )
+            conn.execute(
+                """
+                INSERT INTO github_users(
+                    login,
+                    issue_or_pr_authored,
+                    issue_comments_authored,
+                    pr_reviews_authored,
+                    pr_review_comments_authored,
+                    mentions
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                ("tabversion", 1, 2, 3, 4, 5),
+            )
+            conn.execute(
+                """
+                INSERT INTO necromancy_links(slack_user_id, github_login, created_at, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """,
+                ("U1", "tabversion"),
+            )
+            conn.commit()
+            conn.close()
+
+            fake_lancedb = object()
+            slack_dump = Path(tmpdir) / "data" / "user_context_exports" / "slack" / "slack_user_xiangyu.sqlite"
+            github_dump = Path(tmpdir) / "data" / "user_context_exports" / "github" / "github_user_tabversion.sqlite"
+
+            with patch(
+                "xul_slackbot.summon.ensure_context_dumps",
+                return_value=(slack_dump, github_dump),
+            ), patch(
+                "xul_slackbot.summon.ensure_summon_lancedb_table",
+                return_value=("summon_xiangyu_tabversion", 7),
+            ):
+                progress_updates: list[tuple[int, str]] = []
+                response = handle_summon_command(
+                    db_path,
+                    fake_lancedb,
+                    "xiangyu",
+                    data_dir=Path(tmpdir) / "data",
+                    progress=lambda percent, message: progress_updates.append(
+                        (percent, message)
+                    ),
+                )
+
+            self.assertIn("Summoned necromancy:", response)
+            self.assertIn("documents: 7", response)
+            self.assertEqual(
+                [percent for percent, _ in progress_updates],
+                [10, 20, 30, 40, 50, 60, 70, 80, 90, 100],
+            )
+
+            conn = connect_necromancy_db(db_path)
+            init_summon_schema(conn)
+            active = get_active_summon(conn)
+            conn.close()
+            self.assertIsNotNone(active)
+            self.assertEqual(active["slack_username"], "xiangyu")
+            self.assertEqual(active["github_login"], "tabversion")
+
+    def test_build_summoned_reply_requires_openai_api_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "necromancy.sqlite"
+            conn = connect_necromancy_db(db_path)
+            init_summon_schema(conn)
+            conn.execute(
+                """
+                INSERT INTO summoned_necromancies(
+                    summon_slug,
+                    slack_user_id,
+                    slack_username,
+                    github_login,
+                    lancedb_table,
+                    slack_context_path,
+                    github_context_path
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "xiangyu__tabversion",
+                    "U1",
+                    "xiangyu",
+                    "tabversion",
+                    "summon_xiangyu_tabversion",
+                    "/tmp/slack.sqlite",
+                    "/tmp/github.sqlite",
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO summon_state(singleton, summon_slug, updated_at)
+                VALUES (1, ?, CURRENT_TIMESTAMP)
+                """,
+                ("xiangyu__tabversion",),
+            )
+            conn.commit()
+            conn.close()
+
+            with patch(
+                "xul_slackbot.summon.get_required_config_value",
+                side_effect=ValueError("Missing required `OPENAI_API_KEY`."),
+            ), patch.dict("os.environ", {}, clear=True), patch(
+                "xul_slackbot.summon.search_summon_context",
+                return_value=[],
+            ):
+                response = build_summoned_reply(db_path, object(), "hello")
+
+            self.assertIn("Summon reply failed:", response)
+            self.assertIn("OPENAI_API_KEY", response)
+
+    def test_build_summon_prompts_hide_ai_identity(self) -> None:
+        system_prompt, user_prompt = build_summon_prompts(
+            "xiangyu",
+            "tabversion",
+            "How would you approach this?",
+            "Local context here",
+        )
+
+        self.assertIn("You are xiangyu.", system_prompt)
+        self.assertIn("not as an AI assistant", system_prompt)
+        self.assertIn("Do not mention prompts", system_prompt)
+        self.assertIn("Message to respond to:", user_prompt)
+        self.assertIn("Local context about you:", user_prompt)
 
 
 if __name__ == "__main__":
